@@ -1,0 +1,72 @@
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const PORT = 3000;
+
+const EVENTS_FILE = path.join(__dirname, "events.jsonl");
+
+app.get("/health", (req, res) => {
+  return res.status(200).json({ status: "online" });
+});
+
+app.post("/webhook/chatguru", (req, res) => {
+  const event = {
+    receivedAt: new Date().toISOString(),
+    headers: req.headers,
+    body: req.body,
+  };
+
+  console.log("Webhook recebido:");
+  console.log(JSON.stringify(event, null, 2));
+
+  fs.appendFileSync(EVENTS_FILE, JSON.stringify(event) + "\n");
+
+  return res.status(200).json({ ok: true });
+});
+
+app.listen(PORT, () => {
+  console.log(`Servidor rodando em http://localhost:${PORT}`);
+});
+const 
+express = 
+require("express");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const PORT = 3000;
+
+const EVENTS_FILE = path.join(__dirname, "events.jsonl");
+
+app.get("/health", (req, res) => {
+  return res.status(200).json({ status: "online" });
+});
+
+app.post("/webhook/chatguru", (req, res) => {
+  const event = {
+    receivedAt: new Date().toISOString(),
+    headers: req.headers,
+    body: req.body,
+  };
+
+  console.log("Webhook recebido:");
+  console.log(JSON.stringify(event, null, 2));
+
+  fs.appendFileSync(EVENTS_FILE, JSON.stringify(event) + "\n");
+
+  return res.status(200).json({ ok: true });
+});
+
+app.listen(PORT, () => {
+  console.log(`Servidor rodando em http://localhost:${PORT}`);
+});

@@ -1,61 +1,42 @@
-<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
-<html>
+<!doctype html>
+<html lang="pt-br">
 <head>
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-  <meta http-equiv="Content-Style-Type" content="text/css">
-  <title></title>
-  <meta name="Generator" content="Cocoa HTML Writer">
-  <meta name="CocoaVersion" content="2299.77">
-  <style type="text/css">
-    p.p1 {margin: 0.0px 0.0px 0.0px 0.0px; font: 12.0px Times; -webkit-text-stroke: #000000}
-    p.p2 {margin: 0.0px 0.0px 0.0px 0.0px; font: 12.0px Times; -webkit-text-stroke: #000000; min-height: 14.0px}
-    span.s1 {font-kerning: none}
-  </style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>RT Admin • Login</title>
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-<p class="p1"><span class="s1">&lt;!doctype html&gt;</span></p>
-<p class="p1"><span class="s1">&lt;html lang="pt-br"&gt;</span></p>
-<p class="p1"><span class="s1">&lt;head&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;meta charset="utf-8" /&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;meta name="viewport" content="width=device-width,initial-scale=1" /&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;title&gt;RT Admin • Login&lt;/title&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;link rel="stylesheet" href="/styles.css" /&gt;</span></p>
-<p class="p1"><span class="s1">&lt;/head&gt;</span></p>
-<p class="p1"><span class="s1">&lt;body&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;div class="wrap"&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>&lt;div class="card" style="max-width:480px;margin:60px auto;"&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;h1&gt;Entrar no painel&lt;/h1&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;p&gt;Sem senha, sem festa. Com senha, sem susto.&lt;/p&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;hr /&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;label&gt;Usuário&lt;/label&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;input id="user" placeholder="admin" /&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;label&gt;Senha&lt;/label&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;input id="pass" type="password" placeholder="••••••••" /&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;div class="row" style="margin-top:14px;"&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;button class="btn" id="btn"&gt;Entrar&lt;/button&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;small id="msg"&gt;&lt;/small&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;/div&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>&lt;/div&gt;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;/div&gt;</span></p>
-<p class="p2"><span class="s1"></span><br></p>
-<p class="p1"><span class="s1">&lt;script&gt;</span></p>
-<p class="p1"><span class="s1">const btn = document.getElementById("btn");</span></p>
-<p class="p1"><span class="s1">const msg = document.getElementById("msg");</span></p>
-<p class="p1"><span class="s1">btn.onclick = async () =&gt; {</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>msg.textContent = "Entrando...";</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>const user = document.getElementById("user").value;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>const pass = document.getElementById("pass").value;</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>const r = await fetch("/api/login", {</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>method:"POST",</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>headers:{"Content-Type":"application/json"},</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>body: JSON.stringify({user, pass})</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>});</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>const j = await r.json().catch(()=&gt;({}));</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>if (!r.ok) { msg.textContent = j.error || "Falhou"; return; }</span></p>
-<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>window.location.href = "/admin";</span></p>
-<p class="p1"><span class="s1">};</span></p>
-<p class="p1"><span class="s1">&lt;/script&gt;</span></p>
-<p class="p1"><span class="s1">&lt;/body&gt;</span></p>
-<p class="p1"><span class="s1">&lt;/html&gt;</span></p>
+  <div class="wrap" style="max-width:520px;">
+    <div class="card">
+      <h1>Login • Painel RT</h1>
+      <p>Digite o token administrativo para acessar.</p>
+      <hr/>
+
+      <label>Token (x-rt-admin-token)</label>
+      <input id="token" placeholder="Cole o token aqui" />
+
+      <div class="row" style="margin-top:12px;">
+        <button class="btn" id="enter">Entrar</button>
+        <small id="msg"></small>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const msg = (t) => { $("msg").textContent = t || ""; };
+
+    // se já existe token salvo
+    const saved = localStorage.getItem("rt_admin_token");
+    if (saved) $("token").value = saved;
+
+    $("enter").addEventListener("click", () => {
+      const t = $("token").value.trim();
+      if (!t) return msg("Informe o token.");
+      localStorage.setItem("rt_admin_token", t);
+      window.location.href = "/admin";
+    });
+  </script>
 </body>
 </html>

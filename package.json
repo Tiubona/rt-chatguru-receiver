@@ -1,7 +1,7 @@
 {
   "name": "rt-chatguru-receiver",
   "version": "1.0.0",
-  "description": "Receiver de webhook do ChatGuru (somente recebe e registra)",
+  "description": "Receiver de webhook do ChatGuru (recebe, registra e envia teste pela API)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -12,6 +12,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "axios": "^1.7.9",
     "express": "^5.2.1"
   },
   "devDependencies": {

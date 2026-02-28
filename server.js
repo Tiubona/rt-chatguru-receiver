@@ -22,11 +22,15 @@ const CHATGURU_PHONE_ID = process.env.CHATGURU_PHONE_ID; // phone_id
 // Token simples para proteger rotas administrativas
 const RT_ADMIN_TOKEN = process.env.RT_ADMIN_TOKEN;
 
+// ====== Estado em memória (para TESTE) ======
+// Guarda o último chat recebido pelo webhook
+let lastChat = null;
+
 function appendEvent(obj) {
   try {
     fs.appendFileSync(EVENTS_FILE, JSON.stringify(obj) + "\n", { encoding: "utf8" });
   } catch (_) {
-    // se falhar em cloud, não derruba o serviço
+    // Em cloud, pode falhar (disco efêmero). Não derruba o serviço.
   }
 }
 
@@ -43,6 +47,14 @@ function requireChatGuruConfig() {
   if (!CHATGURU_ACCOUNT_ID) missing.push("CHATGURU_ACCOUNT_ID");
   if (!CHATGURU_PHONE_ID) missing.push("CHATGURU_PHONE_ID");
   return missing;
+}
+
+function requireAdmin(req, res) {
+  const token = req.headers["x-rt-admin-token"];
+  if (!RT_ADMIN_TOKEN || token !== RT_ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Unauthorized (x-rt-admin-token inválido)" });
+  }
+  return null;
 }
 
 async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
@@ -78,36 +90,58 @@ app.get("/health", (_req, res) => {
   return res.status(200).json({ status: "online" });
 });
 
+// Recebe o webhook do ChatGuru
 app.post("/webhook/chatguru", (req, res) => {
+  const body = req.body || {};
+
   const event = {
     receivedAt: new Date().toISOString(),
     ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
     headers: req.headers,
-    body: req.body,
+    body,
   };
 
   console.log("=== Webhook recebido (ChatGuru) ===");
   console.log(JSON.stringify(event, null, 2));
 
+  // Guarda o "último chat" (em memória) para o /reply-last
+  // Usamos os campos que você já viu chegando: chat_id e celular
+  const celular = body.celular || body.chat_number || body.telefone || null;
+  const chatId = body.chat_id || null;
+
+  if (celular) {
+    lastChat = {
+      updatedAt: new Date().toISOString(),
+      celular: String(celular),
+      chat_id: chatId ? String(chatId) : null,
+      nome: body.nome ? String(body.nome) : null,
+      phone_id: body.phone_id ? String(body.phone_id) : null,
+      origem: body.origem ? String(body.origem) : null,
+    };
+
+    console.log("=== lastChat atualizado ===");
+    console.log(JSON.stringify(lastChat, null, 2));
+  } else {
+    console.log("⚠️ Webhook recebido, mas não achei 'celular' no body para lastChat.");
+  }
+
   appendEvent(event);
 
-  // Por enquanto, NÃO envia mensagem automática
+  // Por enquanto, NÃO envia mensagem automática aqui.
   return res.status(200).json({ ok: true });
 });
 
+// Envio manual para qualquer número (já existia)
 app.post("/send-test", async (req, res) => {
   try {
-    const token = req.headers["x-rt-admin-token"];
-    if (!RT_ADMIN_TOKEN || token !== RT_ADMIN_TOKEN) {
-      return res.status(401).json({ ok: false, error: "Unauthorized (x-rt-admin-token inválido)" });
-    }
+    const auth = requireAdmin(req, res);
+    if (auth) return;
 
     const missing = requireChatGuruConfig();
     if (missing.length) {
       return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta no servidor", missing });
     }
 
-    // Debug seguro: imprime o que o servidor está usando (sem vazar key completa)
     console.log("=== ChatGuru config (safe) ===");
     console.log({
       endpoint: CHATGURU_API_ENDPOINT,
@@ -130,7 +164,7 @@ app.post("/send-test", async (req, res) => {
       sendDate: send_date ? String(send_date) : undefined,
     });
 
-    console.log("=== Envio ChatGuru OK ===");
+    console.log("=== Envio ChatGuru OK (send-test) ===");
     console.log(JSON.stringify({ chat_number, text, data }, null, 2));
 
     return res.status(200).json({ ok: true, result: data });
@@ -139,11 +173,76 @@ app.post("/send-test", async (req, res) => {
     const status = err?.response?.status || null;
     const msg = payload || err?.message || String(err);
 
-    console.log("=== Erro ao enviar via ChatGuru ===");
+    console.log("=== Erro ao enviar via ChatGuru (send-test) ===");
     console.log({ status, msg });
 
     return res.status(500).json({ ok: false, error: msg, status });
   }
+});
+
+// ✅ NOVO: responde o último chat recebido (sem digitar número)
+app.post("/reply-last", async (req, res) => {
+  try {
+    const auth = requireAdmin(req, res);
+    if (auth) return;
+
+    const missing = requireChatGuruConfig();
+    if (missing.length) {
+      return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta no servidor", missing });
+    }
+
+    if (!lastChat || !lastChat.celular) {
+      return res.status(400).json({
+        ok: false,
+        error: "Ainda não existe lastChat em memória. Envie uma mensagem do celular para cair no webhook primeiro.",
+      });
+    }
+
+    const { text, send_date } = req.body || {};
+    if (!text) {
+      return res.status(400).json({ ok: false, error: "Body inválido. Envie { text: '...' } (send_date opcional)" });
+    }
+
+    const target = lastChat.celular;
+
+    console.log("=== reply-last ===");
+    console.log({ target, lastChat });
+
+    const data = await chatGuruSendMessage({
+      chatNumber: target,
+      text: String(text),
+      sendDate: send_date ? String(send_date) : undefined,
+    });
+
+    console.log("=== Envio ChatGuru OK (reply-last) ===");
+    console.log(JSON.stringify({ target, text, data }, null, 2));
+
+    return res.status(200).json({
+      ok: true,
+      target,
+      lastChat,
+      result: data,
+    });
+  } catch (err) {
+    const payload = err?.response?.data || null;
+    const status = err?.response?.status || null;
+    const msg = payload || err?.message || String(err);
+
+    console.log("=== Erro ao enviar via ChatGuru (reply-last) ===");
+    console.log({ status, msg });
+
+    return res.status(500).json({ ok: false, error: msg, status });
+  }
+});
+
+// Só pra você inspecionar qual é o lastChat atual (opcional, mas ajuda muito)
+app.get("/last-chat", (req, res) => {
+  // protegido também
+  const token = req.headers["x-rt-admin-token"];
+  if (!RT_ADMIN_TOKEN || token !== RT_ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Unauthorized (x-rt-admin-token inválido)" });
+  }
+  return res.status(200).json({ ok: true, lastChat });
 });
 
 app.listen(PORT, () => {

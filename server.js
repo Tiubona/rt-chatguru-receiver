@@ -1,3 +1,4 @@
+cat > server.js <<'EOF'
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -11,30 +12,15 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 
 // =====================================================
-//  Admin panel (prefer public/, fallback Public/)
+// Admin panel (prefer public/, fallback Public/)
 // =====================================================
 function resolvePublicDir() {
   const lower = path.join(__dirname, "public");
   const upper = path.join(__dirname, "Public");
 
-  if (fs.existsSync(lower)) return lower;
-  if (fs.existsSync(upper)) return upper;
-
-  // tenta achar qualquer pasta "public" nos 2 primeiros níveis (pra debug)
   try {
-    const found = [];
-    const walk = (dir, depth = 0) => {
-      if (depth > 2) return;
-      const items = fs.readdirSync(dir, { withFileTypes: true });
-      for (const it of items) {
-        if (!it.isDirectory()) continue;
-        const full = path.join(dir, it.name);
-        if (it.name.toLowerCase() === "public") found.push(full);
-        walk(full, depth + 1);
-      }
-    };
-    walk(__dirname, 0);
-    if (found.length) return found[0];
+    if (fs.existsSync(lower)) return lower;
+    if (fs.existsSync(upper)) return upper;
   } catch (_) {}
 
   return null;
@@ -49,7 +35,6 @@ if (PUBLIC_DIR) {
   console.log("⚠️ Admin panel static dir NÃO encontrada (public/Public).");
 }
 
-// helpers
 function fileExists(p) {
   try {
     return fs.existsSync(p);
@@ -107,9 +92,10 @@ function requireChatGuruConfig() {
 function requireAdmin(req, res) {
   const token = req.headers["x-rt-admin-token"];
   if (!RT_ADMIN_TOKEN || token !== RT_ADMIN_TOKEN) {
-    return res.status(401).json({ ok: false, error: "Unauthorized (x-rt-admin-token inválido)" });
+    res.status(401).json({ ok: false, error: "Unauthorized (x-rt-admin-token inválido)" });
+    return true;
   }
-  return null;
+  return false;
 }
 
 async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
@@ -134,32 +120,30 @@ async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
 // =====================================================
 app.get("/health", (_req, res) => res.status(200).json({ status: "online" }));
 
+// ✅ rota pra você confirmar se o Render atualizou (sem achismo)
+app.get("/version", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    commit: process.env.RENDER_GIT_COMMIT || process.env.COMMIT_SHA || null,
+    renderedAt: new Date().toISOString(),
+    publicDir: PUBLIC_DIR,
+  });
+});
+
 // raiz: manda pro login
 app.get("/", (_req, res) => res.redirect("/login"));
 
 // ✅ rota amigável login
 app.get("/login", (_req, res) => {
-  // se existir login.html, serve ele
-  if (PUBLIC_DIR && fileExists(path.join(PUBLIC_DIR, "login.html"))) {
-    return sendPublicFile(res, "login.html");
-  }
-  // fallback: se não existir, tenta admin.html (pra não quebrar)
-  if (PUBLIC_DIR && fileExists(path.join(PUBLIC_DIR, "admin.html"))) {
-    return sendPublicFile(res, "admin.html");
-  }
+  if (PUBLIC_DIR && fileExists(path.join(PUBLIC_DIR, "login.html"))) return sendPublicFile(res, "login.html");
+  if (PUBLIC_DIR && fileExists(path.join(PUBLIC_DIR, "admin.html"))) return sendPublicFile(res, "admin.html");
   return res.status(500).send("Admin panel files not found (login.html/admin.html).");
 });
 
 // ✅ rota amigável admin
 app.get("/admin", (_req, res) => {
-  // se existir admin.html, serve ele
-  if (PUBLIC_DIR && fileExists(path.join(PUBLIC_DIR, "admin.html"))) {
-    return sendPublicFile(res, "admin.html");
-  }
-  // fallback: se não existir, tenta login.html
-  if (PUBLIC_DIR && fileExists(path.join(PUBLIC_DIR, "login.html"))) {
-    return sendPublicFile(res, "login.html");
-  }
+  if (PUBLIC_DIR && fileExists(path.join(PUBLIC_DIR, "admin.html"))) return sendPublicFile(res, "admin.html");
+  if (PUBLIC_DIR && fileExists(path.join(PUBLIC_DIR, "login.html"))) return sendPublicFile(res, "login.html");
   return res.status(500).send("Admin panel files not found (admin.html/login.html).");
 });
 
@@ -206,8 +190,7 @@ app.post("/webhook/chatguru", (req, res) => {
 // =====================================================
 app.post("/send-test", async (req, res) => {
   try {
-    const auth = requireAdmin(req, res);
-    if (auth) return;
+    if (requireAdmin(req, res)) return;
 
     const missing = requireChatGuruConfig();
     if (missing.length) return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta", missing });
@@ -236,8 +219,7 @@ app.post("/send-test", async (req, res) => {
 // =====================================================
 app.post("/reply-last", async (req, res) => {
   try {
-    const auth = requireAdmin(req, res);
-    if (auth) return;
+    if (requireAdmin(req, res)) return;
 
     const missing = requireChatGuruConfig();
     if (missing.length) return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta", missing });
@@ -274,7 +256,7 @@ app.get("/last-chat", (req, res) => {
   return res.status(200).json({ ok: true, lastChat });
 });
 
-// =====================================================
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
+EOF

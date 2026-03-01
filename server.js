@@ -245,8 +245,8 @@ async function dbInit() {
       );
     `);
 
-    await client.query(\`CREATE INDEX IF NOT EXISTS idx_cg_events_received_at ON cg_events(received_at);\`);
-    await client.query(\`CREATE INDEX IF NOT EXISTS idx_cg_events_celular ON cg_events(celular);\`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_events_received_at ON cg_events(received_at);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_events_celular ON cg_events(celular);`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS cg_sends (
@@ -259,7 +259,7 @@ async function dbInit() {
       );
     `);
 
-    await client.query(\`CREATE INDEX IF NOT EXISTS idx_cg_sends_sent_at ON cg_sends(sent_at);\`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_sends_sent_at ON cg_sends(sent_at);`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS admin_config (

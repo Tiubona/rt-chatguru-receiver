@@ -2,10 +2,10 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const session = require("express-session");
 const bcrypt = require("bcryptjs");
 const nodemailer = require("nodemailer");
 const { Pool } = require("pg");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 
@@ -33,7 +33,10 @@ const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || null;
 
-const SESSION_SECRET = process.env.SESSION_SECRET || "change_me_super_secret";
+// ⚠️ Reaproveitando sua env atual: se você já usa SESSION_SECRET, ele vira o segredo do JWT
+const ADMIN_JWT_SECRET = process.env.SESSION_SECRET || "change_me_super_secret";
+const ADMIN_JWT_COOKIE = "rt_admin_jwt";
+const ADMIN_JWT_MAX_AGE_MS = 1000 * 60 * 60 * 12; // 12h
 
 // ====== Email (alerts) ======
 const SMTP_HOST = process.env.SMTP_HOST || null;
@@ -44,7 +47,12 @@ const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER || null;
 
 // ====== DB (Postgres) ======
 const DATABASE_URL = process.env.DATABASE_URL || null;
-const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: process.env.PGSSLMODE ? { rejectUnauthorized: false } : undefined }) : null;
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSLMODE ? { rejectUnauthorized: false } : undefined,
+    })
+  : null;
 
 // ====== Estado em memória (para TESTE) ======
 let lastChat = null;
@@ -80,8 +88,60 @@ function requireAdminToken(req, res) {
   return true;
 }
 
+// ====== Cookies (sem dependência) ======
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  const out = {};
+  header.split(";").forEach((part) => {
+    const p = part.trim();
+    if (!p) return;
+    const idx = p.indexOf("=");
+    if (idx === -1) return;
+    const k = p.slice(0, idx).trim();
+    const v = p.slice(idx + 1).trim();
+    out[k] = decodeURIComponent(v);
+  });
+  return out;
+}
+
+function setCookie(res, name, value, opts = {}) {
+  const parts = [];
+  parts.push(`${name}=${encodeURIComponent(value)}`);
+
+  if (opts.maxAge != null) parts.push(`Max-Age=${Math.floor(opts.maxAge / 1000)}`);
+  if (opts.path) parts.push(`Path=${opts.path}`);
+  if (opts.httpOnly) parts.push("HttpOnly");
+  if (opts.sameSite) parts.push(`SameSite=${opts.sameSite}`);
+  if (opts.secure) parts.push("Secure");
+
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function clearCookie(res, name) {
+  // expira imediatamente
+  res.setHeader("Set-Cookie", `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax`);
+}
+
+// ====== Auth (JWT) ======
+function issueAdminJwt() {
+  const payload = { admin: true };
+  return jwt.sign(payload, ADMIN_JWT_SECRET, { expiresIn: "12h" });
+}
+
+function verifyAdminJwt(token) {
+  try {
+    const decoded = jwt.verify(token, ADMIN_JWT_SECRET);
+    return !!decoded && decoded.admin === true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function isAdminAuthed(req) {
-  return !!(req.session && req.session.admin === true);
+  const cookies = parseCookies(req);
+  const token = cookies[ADMIN_JWT_COOKIE] || null;
+  if (!token) return false;
+  return verifyAdminJwt(token);
 }
 
 function requireAdminSession(req, res) {
@@ -138,13 +198,8 @@ async function dbInit() {
       );
     `);
 
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_cg_events_received_at ON cg_events(received_at);
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_cg_events_celular ON cg_events(celular);
-    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_events_received_at ON cg_events(received_at);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_events_celular ON cg_events(celular);`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS cg_sends (
@@ -157,9 +212,7 @@ async function dbInit() {
       );
     `);
 
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_cg_sends_sent_at ON cg_sends(sent_at);
-    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_sends_sent_at ON cg_sends(sent_at);`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS admin_config (
@@ -280,23 +333,6 @@ async function sendAlertEmail(subject, text) {
     console.log("ALERT email fail:", e?.message || e);
   }
 }
-
-// ====== Sessions ======
-app.set("trust proxy", 1);
-app.use(
-  session({
-    name: "rt_admin_session",
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production", // no Render geralmente é true
-      maxAge: 1000 * 60 * 60 * 12, // 12h
-    },
-  })
-);
 
 // ====== Pages (HTML) ======
 function htmlLayout(title, body) {
@@ -425,7 +461,9 @@ function loginPage(errorMsg) {
 
 function adminShell(active) {
   const nav = (href, label) =>
-    `<a class="pill" href="${href}" style="${active === href ? "background:rgba(58,160,255,.18);border-color:rgba(58,160,255,.35);" : ""}">${label}</a>`;
+    `<a class="pill" href="${href}" style="${
+      active === href ? "background:rgba(58,160,255,.18);border-color:rgba(58,160,255,.35);" : ""
+    }">${label}</a>`;
   return `
   <div class="wrap">
     <div class="topbar">
@@ -571,7 +609,7 @@ app.get("/last-chat", (req, res) => {
 // ================== ADMIN PANEL ==================
 
 // Login pages
-app.get("/admin/login", (req, res) => res.status(200).send(loginPage(null)));
+app.get("/admin/login", (_req, res) => res.status(200).send(loginPage(null)));
 
 app.post("/admin/login", async (req, res) => {
   const user = String(req.body.user || "");
@@ -593,12 +631,22 @@ app.post("/admin/login", async (req, res) => {
 
   if (!ok) return res.status(200).send(loginPage("Usuário ou senha inválidos."));
 
-  req.session.admin = true;
+  const token = issueAdminJwt();
+
+  setCookie(res, ADMIN_JWT_COOKIE, token, {
+    path: "/",
+    httpOnly: true,
+    sameSite: "Lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: ADMIN_JWT_MAX_AGE_MS,
+  });
+
   return res.redirect("/admin");
 });
 
-app.get("/admin/logout", (req, res) => {
-  req.session.destroy(() => res.redirect("/admin/login"));
+app.get("/admin/logout", (_req, res) => {
+  clearCookie(res, ADMIN_JWT_COOKIE);
+  return res.redirect("/admin/login");
 });
 
 // Dashboard
@@ -655,7 +703,9 @@ app.get("/admin", async (req, res) => {
         <div class="card">
           <div class="title" style="font-size:16px; margin-bottom:6px;">Último chat (memória do servidor)</div>
           <div class="hint">Isso zera se o Render reiniciar — serve para debug rápido.</div>
-          <pre style="white-space:pre-wrap; margin:12px 0 0; background:rgba(0,0,0,.18); padding:12px; border-radius:16px; border:1px solid rgba(255,255,255,.10);">${escapeHtml(JSON.stringify(lastChat, null, 2))}</pre>
+          <pre style="white-space:pre-wrap; margin:12px 0 0; background:rgba(0,0,0,.18); padding:12px; border-radius:16px; border:1px solid rgba(255,255,255,.10);">${escapeHtml(
+            JSON.stringify(lastChat, null, 2)
+          )}</pre>
         </div>
       </div>
     ${adminFooter()}
@@ -685,7 +735,9 @@ app.get("/admin/chats", async (req, res) => {
             <div style="min-width:180px;">
               <div class="hint">Período</div>
               <select name="period">
-                ${["1d","7d","30d","90d"].map(p => `<option value="${p}" ${String(period)===p?"selected":""}>${p}</option>`).join("")}
+                ${["1d", "7d", "30d", "90d"]
+                  .map((p) => `<option value="${p}" ${String(period) === p ? "selected" : ""}>${p}</option>`)
+                  .join("")}
               </select>
             </div>
             <button type="submit">Aplicar</button>
@@ -721,14 +773,18 @@ app.get("/admin/chats", async (req, res) => {
             <tr><th>Celular</th><th>Nome</th><th>Recebidas</th><th>Última</th></tr>
           </thead>
           <tbody>
-            ${top.map(r => `
+            ${top
+              .map(
+                (r) => `
               <tr>
                 <td>${escapeHtml(r.celular || "-")}</td>
                 <td>${escapeHtml(r.nome || "-")}</td>
                 <td>${r.count}</td>
                 <td>${escapeHtml(r.last_at || "-")}</td>
               </tr>
-            `).join("") || `<tr><td colspan="4" class="hint">Sem dados (ou DB desligado).</td></tr>`}
+            `
+              )
+              .join("") || `<tr><td colspan="4" class="hint">Sem dados (ou DB desligado).</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -780,7 +836,7 @@ app.post("/admin/alerts", async (req, res) => {
   const raw = String(req.body.emails || "");
   const emails = raw
     .split("\n")
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 
   await cfgSet("alert_emails", { emails });
@@ -836,14 +892,18 @@ app.get("/admin/training", async (req, res) => {
             <tr><th>Data</th><th>Tag</th><th>Cliente</th><th>Resposta</th></tr>
           </thead>
           <tbody>
-            ${rows.map(r => `
+            ${rows
+              .map(
+                (r) => `
               <tr>
                 <td>${escapeHtml(r.created_at || "-")}</td>
                 <td>${escapeHtml(r.tag || "-")}</td>
                 <td>${escapeHtml(short(r.user_text))}</td>
                 <td>${escapeHtml(short(r.ideal_answer))}</td>
               </tr>
-            `).join("") || `<tr><td colspan="4" class="hint">Sem dados (ou DB desligado).</td></tr>`}
+            `
+              )
+              .join("") || `<tr><td colspan="4" class="hint">Sem dados (ou DB desligado).</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -861,13 +921,14 @@ app.post("/admin/training", async (req, res) => {
   const ideal_answer = (req.body.ideal_answer || "").toString().trim();
 
   if (!user_text || !ideal_answer) return res.redirect("/admin/training");
-
   if (!pool) return res.redirect("/admin/training");
 
-  await pool.query(
-    `INSERT INTO ai_training (created_at, tag, user_text, ideal_answer) VALUES ($1,$2,$3,$4)`,
-    [new Date().toISOString(), tag, user_text, ideal_answer]
-  );
+  await pool.query(`INSERT INTO ai_training (created_at, tag, user_text, ideal_answer) VALUES ($1,$2,$3,$4)`, [
+    new Date().toISOString(),
+    tag,
+    user_text,
+    ideal_answer,
+  ]);
 
   return res.redirect("/admin/training");
 });
@@ -889,30 +950,19 @@ function periodToSql(period) {
 
 async function getStats(period) {
   if (!pool) {
-    // fallback bem simples: sem DB, mostra zeros + lastChat como sinal de vida
     return { uniqueChats: 0, newChats: 0, received: 0, sent: 0 };
   }
 
   const interval = periodToSql(period);
 
-  // received
-  const receivedR = await pool.query(
-    `SELECT COUNT(*)::int AS c FROM cg_events WHERE received_at >= NOW() - INTERVAL '${interval}'`
-  );
+  const receivedR = await pool.query(`SELECT COUNT(*)::int AS c FROM cg_events WHERE received_at >= NOW() - INTERVAL '${interval}'`);
+  const sentR = await pool.query(`SELECT COUNT(*)::int AS c FROM cg_sends WHERE sent_at >= NOW() - INTERVAL '${interval}'`);
 
-  // sent
-  const sentR = await pool.query(
-    `SELECT COUNT(*)::int AS c FROM cg_sends WHERE sent_at >= NOW() - INTERVAL '${interval}'`
-  );
-
-  // unique chats (distinct celular) no período
   const uniqR = await pool.query(
     `SELECT COUNT(DISTINCT celular)::int AS c FROM cg_events WHERE received_at >= NOW() - INTERVAL '${interval}' AND celular IS NOT NULL`
   );
 
-  // new chats: primeira vez (no histórico) que o celular aparece
-  const newR = await pool.query(
-    `
+  const newR = await pool.query(`
     SELECT COUNT(*)::int AS c
     FROM (
       SELECT celular, MIN(received_at) AS first_seen
@@ -921,8 +971,7 @@ async function getStats(period) {
       GROUP BY celular
     ) t
     WHERE t.first_seen >= NOW() - INTERVAL '${interval}'
-    `
-  );
+  `);
 
   return {
     uniqueChats: uniqR.rows[0].c,
@@ -936,8 +985,7 @@ async function getTopChats(period) {
   if (!pool) return [];
   const interval = periodToSql(period);
 
-  const r = await pool.query(
-    `
+  const r = await pool.query(`
     SELECT
       celular,
       MAX(nome) AS nome,
@@ -949,16 +997,13 @@ async function getTopChats(period) {
     GROUP BY celular
     ORDER BY count DESC
     LIMIT 15
-    `
-  );
+  `);
   return r.rows;
 }
 
 async function getTrainingRows() {
   if (!pool) return [];
-  const r = await pool.query(
-    `SELECT created_at::text, tag, user_text, ideal_answer FROM ai_training ORDER BY id DESC LIMIT 30`
-  );
+  const r = await pool.query(`SELECT created_at::text, tag, user_text, ideal_answer FROM ai_training ORDER BY id DESC LIMIT 30`);
   return r.rows;
 }
 

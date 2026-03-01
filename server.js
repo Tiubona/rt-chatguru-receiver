@@ -221,6 +221,40 @@ function extractOpenAIText(data) {
   }
 }
 
+// ====== OpenAI helpers ======
+function extractResponseText(data) {
+  if (!data) return "";
+
+  // 1) alguns retornos trazem isso direto
+  if (typeof data.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+
+  // 2) formato mais comum: output -> content -> output_text
+  const out = Array.isArray(data.output) ? data.output : [];
+  const chunks = [];
+
+  for (const item of out) {
+    // alguns modelos colocam texto direto aqui
+    if (item && typeof item.text === "string" && item.text.trim()) {
+      chunks.push(item.text.trim());
+    }
+
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const c of content) {
+      if (c?.type === "output_text" && typeof c.text === "string" && c.text.trim()) {
+        chunks.push(c.text.trim());
+      }
+      // fallback para variações
+      if (typeof c?.text === "string" && c.text.trim()) {
+        chunks.push(c.text.trim());
+      }
+    }
+  }
+
+  return chunks.join("\n").trim();
+}
+
 // ====== OpenAI call (Responses API) ======
 async function openaiCreateReply({ system, user }) {
   const missing = requireOpenAIConfig();
@@ -235,26 +269,34 @@ async function openaiCreateReply({ system, user }) {
   if (OPENAI_PROJECT) headers["OpenAI-Project"] = OPENAI_PROJECT;
   if (OPENAI_ORG) headers["OpenAI-Organization"] = OPENAI_ORG;
 
-  const payload = {
-    model: OPENAI_MODEL,
-    input: [
-      {
-        role: "system",
-        content: [{ type: "input_text", text: String(system || "") }],
-      },
-      {
-        role: "user",
-        content: [{ type: "input_text", text: String(user || "") }],
-      },
-    ],
-  };
+  // Mantém simples e compatível: manda um input string único (docs oficiais fazem assim)
+  const inputText =
+    `SISTEMA:\n${String(system || "").trim()}\n\n` +
+    `CLIENTE:\n${String(user || "").trim()}\n\n` +
+    `Responda somente com a mensagem final para o cliente.`;
 
-  const resp = await axios.post("https://api.openai.com/v1/responses", payload, { timeout: 20000, headers });
+  const resp = await axios.post(
+    "https://api.openai.com/v1/responses",
+    {
+      model: OPENAI_MODEL,
+      input: inputText,
+      // deixa “chat rápido” por padrão
+      reasoning: { effort: "none" },
+      max_output_tokens: 220,
+    },
+    { timeout: 30000, headers }
+  );
 
-  const text = extractOpenAIText(resp.data);
-  return text;
+  const reply = extractResponseText(resp.data);
+
+  // Se ainda vier vazio, devolve um erro explícito pra você enxergar no curl
+  if (!reply) {
+    console.log("⚠️ OpenAI retornou sem texto. Debug resp.data:");
+    console.log(JSON.stringify(resp.data, null, 2));
+  }
+
+  return reply;
 }
-
 // ====== DB bootstrap ======
 async function dbInit() {
   if (!pool) {

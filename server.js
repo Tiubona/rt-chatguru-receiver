@@ -192,6 +192,35 @@ async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
   return resp.data;
 }
 
+// ====== OpenAI helpers ======
+function extractOpenAIText(data) {
+  try {
+    if (!data) return "";
+    if (typeof data.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+
+    // fallback: percorre output[].content[]
+    const output = data.output;
+    if (!Array.isArray(output)) return "";
+
+    const chunks = [];
+    for (const item of output) {
+      if (!item || item.type !== "message") continue;
+      const content = item.content;
+      if (!Array.isArray(content)) continue;
+
+      for (const c of content) {
+        // formatos possíveis
+        if (c && typeof c.text === "string" && c.text.trim()) chunks.push(c.text);
+        if (c && c.text && typeof c.text.value === "string" && c.text.value.trim()) chunks.push(c.text.value);
+      }
+    }
+
+    return chunks.join("\n").trim();
+  } catch (_) {
+    return "";
+  }
+}
+
 // ====== OpenAI call (Responses API) ======
 async function openaiCreateReply({ system, user }) {
   const missing = requireOpenAIConfig();
@@ -206,19 +235,23 @@ async function openaiCreateReply({ system, user }) {
   if (OPENAI_PROJECT) headers["OpenAI-Project"] = OPENAI_PROJECT;
   if (OPENAI_ORG) headers["OpenAI-Organization"] = OPENAI_ORG;
 
-  const resp = await axios.post(
-    "https://api.openai.com/v1/responses",
-    {
-      model: OPENAI_MODEL,
-      input: [
-        { role: "system", content: String(system || "") },
-        { role: "user", content: String(user || "") },
-      ],
-    },
-    { timeout: 20000, headers }
-  );
+  const payload = {
+    model: OPENAI_MODEL,
+    input: [
+      {
+        role: "system",
+        content: [{ type: "input_text", text: String(system || "") }],
+      },
+      {
+        role: "user",
+        content: [{ type: "input_text", text: String(user || "") }],
+      },
+    ],
+  };
 
-  const text = resp.data && resp.data.output_text ? String(resp.data.output_text).trim() : "";
+  const resp = await axios.post("https://api.openai.com/v1/responses", payload, { timeout: 20000, headers });
+
+  const text = extractOpenAIText(resp.data);
   return text;
 }
 

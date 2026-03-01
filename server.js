@@ -225,34 +225,51 @@ function extractOpenAIText(data) {
 function extractResponseText(data) {
   if (!data) return "";
 
-  // 1) alguns retornos trazem isso direto
+  const pieces = [];
+
+  // 1) output_text direto (quando vier)
   if (typeof data.output_text === "string" && data.output_text.trim()) {
-    return data.output_text.trim();
+    pieces.push(data.output_text.trim());
   }
 
-  // 2) formato mais comum: output -> content -> output_text
+  // 2) output -> content
   const out = Array.isArray(data.output) ? data.output : [];
-  const chunks = [];
-
   for (const item of out) {
-    // alguns modelos colocam texto direto aqui
-    if (item && typeof item.text === "string" && item.text.trim()) {
-      chunks.push(item.text.trim());
-    }
-
     const content = Array.isArray(item?.content) ? item.content : [];
     for (const c of content) {
       if (c?.type === "output_text" && typeof c.text === "string" && c.text.trim()) {
-        chunks.push(c.text.trim());
-      }
-      // fallback para variações
-      if (typeof c?.text === "string" && c.text.trim()) {
-        chunks.push(c.text.trim());
+        pieces.push(c.text.trim());
+      } else if (typeof c?.text === "string" && c.text.trim()) {
+        pieces.push(c.text.trim());
       }
     }
   }
 
-  return chunks.join("\n").trim();
+  // Dedup: remove repetições exatas e também caso o texto final tenha sido concatenado 2x
+  const uniq = [];
+  const seen = new Set();
+  for (const p of pieces) {
+    const key = p.replace(/\s+/g, " ").trim(); // normaliza espaço
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniq.push(p);
+  }
+
+  // Se por acaso ainda vier duplicado colado (A\nA), resolve por heurística simples
+  let result = uniq.join("\n").trim();
+
+  // Remove duplicação “bloco inteiro repetido”
+  const half = Math.floor(result.length / 2);
+  if (result.length > 40) {
+    const a = result.slice(0, half).trim();
+    const b = result.slice(half).trim();
+    if (a && b && (a === b || a.replace(/\s+/g, " ") === b.replace(/\s+/g, " "))) {
+      result = a;
+    }
+  }
+
+  return result.trim();
 }
 
 // ====== OpenAI call (Responses API) ======

@@ -10,7 +10,7 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 
-// ====== Painel (public/Public) ======
+// ====== Resolve pasta public/Public ======
 function resolvePublicDir() {
   const lower = path.join(__dirname, "public");
   const upper = path.join(__dirname, "Public");
@@ -18,21 +18,15 @@ function resolvePublicDir() {
   if (fs.existsSync(upper)) return upper;
   return null;
 }
+
 const PUBLIC_DIR = resolvePublicDir();
+if (PUBLIC_DIR) console.log(`Admin panel static dir: ${PUBLIC_DIR}`);
+else console.log("⚠️ Admin panel static dir NÃO encontrada (public/Public).");
 
-if (PUBLIC_DIR) {
-  app.use(express.static(PUBLIC_DIR));
-  console.log(`Admin panel static dir: ${PUBLIC_DIR}`);
-} else {
-  console.log("⚠️ Admin panel static dir NÃO encontrada (public/Public).");
-}
-
-// ====== Persistência local ======
+// ====== Persistência local (debug) ======
 const EVENTS_FILE = path.join(__dirname, "events.jsonl");
-const CONFIG_FILE = path.join(__dirname, "config.json");
-const KNOWLEDGE_FILE = path.join(__dirname, "knowledge.txt");
 
-// ====== ChatGuru API (Render env vars) ======
+// ====== ChatGuru config (Render env vars) ======
 const CHATGURU_API_ENDPOINT = process.env.CHATGURU_API_ENDPOINT;
 const CHATGURU_API_KEY = process.env.CHATGURU_API_KEY;
 const CHATGURU_ACCOUNT_ID = process.env.CHATGURU_ACCOUNT_ID;
@@ -42,52 +36,19 @@ const RT_ADMIN_TOKEN = process.env.RT_ADMIN_TOKEN;
 
 // ====== Estado em memória ======
 let lastChat = null;
-
-// contadores simples pro painel
-let counters = {
-  webhooksReceived: 0,
-  messagesSent: 0,
+let stats = {
+  received: 0,
+  sent: 0,
   sendErrors: 0,
   lastError: null,
 };
-
-// config/knowledge persistidos
-function safeReadJson(filePath, fallback) {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    const raw = fs.readFileSync(filePath, "utf8");
-    return JSON.parse(raw);
-  } catch (_) {
-    return fallback;
-  }
-}
-
-function safeWriteJson(filePath, obj) {
-  fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf8");
-}
-
-function safeReadText(filePath, fallback = "") {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    return fs.readFileSync(filePath, "utf8");
-  } catch (_) {
-    return fallback;
-  }
-}
-
-function safeWriteText(filePath, text) {
-  fs.writeFileSync(filePath, String(text || ""), "utf8");
-}
-
-let appConfig = safeReadJson(CONFIG_FILE, {
-  enabled: true,
+let knowledgeText = "";
+let config = {
+  enabled: false,
   start: "08:30",
   end: "18:30",
-});
+};
 
-let knowledgeBase = safeReadText(KNOWLEDGE_FILE, "");
-
-// ====== Helpers ======
 function appendEvent(obj) {
   try {
     fs.appendFileSync(EVENTS_FILE, JSON.stringify(obj) + "\n", { encoding: "utf8" });
@@ -111,6 +72,103 @@ function requireAdmin(req, res) {
   return null;
 }
 
+// ====== Helper: servir HTML SEM chance de virar texto ======
+function sendHtmlFile(res, filename) {
+  if (!PUBLIC_DIR) return res.status(500).send("Admin panel folder not found (public/Public).");
+
+  const full = path.join(PUBLIC_DIR, filename);
+  if (!fs.existsSync(full)) return res.status(404).send(`File not found: ${filename}`);
+
+  // mata cache (principalmente Cloudflare/Render)
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+
+  // garante que o browser interprete como HTML
+  res.status(200).type("html; charset=utf-8").send(fs.readFileSync(full, "utf8"));
+}
+
+// ====== Estáticos (CSS/JS) ======
+if (PUBLIC_DIR) {
+  app.use(
+    express.static(PUBLIC_DIR, {
+      etag: false,
+      lastModified: false,
+      setHeaders(res, filePath) {
+        // cache curto pra assets
+        if (filePath.endsWith(".css") || filePath.endsWith(".js")) {
+          res.setHeader("Cache-Control", "public, max-age=60");
+        }
+      },
+    })
+  );
+}
+
+// ====== Rotas base ======
+app.get("/health", (_req, res) => res.status(200).json({ status: "online" }));
+
+app.get("/", (_req, res) => res.redirect("/login"));
+
+// ✅ login/admin SEM sendFile (pra não virar “texto”)
+app.get("/login", (_req, res) => sendHtmlFile(res, "login.html"));
+app.get("/admin", (_req, res) => sendHtmlFile(res, "admin.html"));
+
+// ✅ version (pra você ver commit/versão no ar)
+app.get("/version", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    name: "rt-chatguru-receiver",
+    version: process.env.npm_package_version || "1.0.0",
+    commit: process.env.RENDER_GIT_COMMIT || process.env.COMMIT || null,
+    node: process.version,
+    env: process.env.NODE_ENV || "production",
+    time: new Date().toISOString(),
+  });
+});
+
+// ====== API do painel (pra parar 404 no log) ======
+app.get("/api/stats", (req, res) => {
+  const auth = requireAdmin(req, res);
+  if (auth) return;
+  return res.status(200).json({
+    ok: true,
+    stats,
+    lastChat,
+  });
+});
+
+app.get("/api/knowledge", (req, res) => {
+  const auth = requireAdmin(req, res);
+  if (auth) return;
+  return res.status(200).json({ ok: true, text: knowledgeText });
+});
+
+app.post("/api/knowledge", (req, res) => {
+  const auth = requireAdmin(req, res);
+  if (auth) return;
+  knowledgeText = String((req.body && req.body.text) || "");
+  return res.status(200).json({ ok: true });
+});
+
+app.get("/api/config", (req, res) => {
+  const auth = requireAdmin(req, res);
+  if (auth) return;
+  return res.status(200).json({ ok: true, config });
+});
+
+app.post("/api/config", (req, res) => {
+  const auth = requireAdmin(req, res);
+  if (auth) return;
+
+  const body = req.body || {};
+  if (typeof body.enabled === "boolean") config.enabled = body.enabled;
+  if (typeof body.start === "string") config.start = body.start;
+  if (typeof body.end === "string") config.end = body.end;
+
+  return res.status(200).json({ ok: true, config });
+});
+
+// ====== ChatGuru sender ======
 async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
   const params = new URLSearchParams({
     key: CHATGURU_API_KEY,
@@ -128,108 +186,18 @@ async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
   return resp.data;
 }
 
-// ====== Rotas base ======
-app.get("/health", (_req, res) => res.status(200).json({ status: "online" }));
-
-// ✅ /version (pra você conferir o que está rodando no Render)
-app.get("/version", (_req, res) => {
-  let pkg = {};
-  try {
-    pkg = require(path.join(__dirname, "package.json"));
-  } catch (_) {}
-
-  return res.status(200).json({
-    ok: true,
-    name: pkg.name || "rt-chatguru-receiver",
-    version: pkg.version || "0.0.0",
-    commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
-    node: process.version,
-    env: process.env.NODE_ENV || "unknown",
-    time: new Date().toISOString(),
-  });
-});
-
-// ✅ Rotas amigáveis do painel
-app.get("/login", (_req, res) => {
-  if (!PUBLIC_DIR) return res.status(500).send("Admin panel folder not found (public/Public).");
-  return res.sendFile(path.join(PUBLIC_DIR, "login.html"));
-});
-
-app.get("/admin", (_req, res) => {
-  if (!PUBLIC_DIR) return res.status(500).send("Admin panel folder not found (public/Public).");
-  return res.sendFile(path.join(PUBLIC_DIR, "admin.html"));
-});
-
-// raiz: manda pro login
-app.get("/", (_req, res) => res.redirect("/login"));
-
-// ====== API do painel (o admin.js chama isso) ======
-app.get("/api/stats", (req, res) => {
-  const auth = requireAdmin(req, res);
-  if (auth) return;
-
-  return res.status(200).json({
-    ok: true,
-    counters,
-    lastChat,
-  });
-});
-
-app.get("/api/config", (req, res) => {
-  const auth = requireAdmin(req, res);
-  if (auth) return;
-
-  return res.status(200).json({ ok: true, config: appConfig });
-});
-
-app.post("/api/config", (req, res) => {
-  const auth = requireAdmin(req, res);
-  if (auth) return;
-
-  const { enabled, start, end } = req.body || {};
-  if (typeof enabled === "boolean") appConfig.enabled = enabled;
-  if (typeof start === "string") appConfig.start = start;
-  if (typeof end === "string") appConfig.end = end;
-
-  safeWriteJson(CONFIG_FILE, appConfig);
-
-  return res.status(200).json({ ok: true, config: appConfig });
-});
-
-app.get("/api/knowledge", (req, res) => {
-  const auth = requireAdmin(req, res);
-  if (auth) return;
-
-  return res.status(200).json({ ok: true, knowledge: knowledgeBase || "" });
-});
-
-app.post("/api/knowledge", (req, res) => {
-  const auth = requireAdmin(req, res);
-  if (auth) return;
-
-  const { knowledge } = req.body || {};
-  knowledgeBase = String(knowledge || "");
-  safeWriteText(KNOWLEDGE_FILE, knowledgeBase);
-
-  return res.status(200).json({ ok: true });
-});
-
 // ====== Webhook receiver ======
 app.post("/webhook/chatguru", (req, res) => {
   const body = req.body || {};
 
   const event = {
-    type: "webhook_received",
     receivedAt: new Date().toISOString(),
     ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
     headers: req.headers,
     body,
   };
 
-  counters.webhooksReceived += 1;
-
-  console.log("=== Webhook recebido (ChatGuru) ===");
-  console.log(JSON.stringify(event, null, 2));
+  stats.received += 1;
 
   const celular = body.celular || body.chat_number || body.telefone || null;
   const chatId = body.chat_id || null;
@@ -243,8 +211,6 @@ app.post("/webhook/chatguru", (req, res) => {
       phone_id: body.phone_id ? String(body.phone_id) : null,
       origem: body.origem ? String(body.origem) : null,
     };
-  } else {
-    console.log("⚠️ Webhook recebido, mas não achei 'celular' no body para lastChat.");
   }
 
   appendEvent(event);
@@ -271,89 +237,19 @@ app.post("/send-test", async (req, res) => {
       sendDate: send_date ? String(send_date) : undefined,
     });
 
-    counters.messagesSent += 1;
-
-    appendEvent({
-      type: "message_sent",
-      at: new Date().toISOString(),
-      chat_number: String(chat_number),
-      ok: true,
-      result: data,
-    });
-
+    stats.sent += 1;
     return res.status(200).json({ ok: true, result: data });
   } catch (err) {
+    stats.sendErrors += 1;
+    stats.lastError = err?.response?.data || err?.message || String(err);
+
     const payload = err?.response?.data || null;
     const status = err?.response?.status || null;
-
-    counters.sendErrors += 1;
-    counters.lastError = payload || err?.message || String(err);
-
-    appendEvent({
-      type: "message_send_error",
-      at: new Date().toISOString(),
-      ok: false,
-      status,
-      error: counters.lastError,
-    });
-
-    return res.status(500).json({ ok: false, error: counters.lastError, status });
+    return res.status(500).json({ ok: false, error: payload || err?.message || String(err), status });
   }
 });
 
-// ====== Responder último chat ======
-app.post("/reply-last", async (req, res) => {
-  try {
-    const auth = requireAdmin(req, res);
-    if (auth) return;
-
-    const missing = requireChatGuruConfig();
-    if (missing.length) return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta", missing });
-
-    if (!lastChat || !lastChat.celular) {
-      return res.status(400).json({ ok: false, error: "Sem lastChat. Envie uma msg pro webhook primeiro." });
-    }
-
-    const { text, send_date } = req.body || {};
-    if (!text) return res.status(400).json({ ok: false, error: "Envie { text: '...' }" });
-
-    const data = await chatGuruSendMessage({
-      chatNumber: lastChat.celular,
-      text: String(text),
-      sendDate: send_date ? String(send_date) : undefined,
-    });
-
-    counters.messagesSent += 1;
-
-    appendEvent({
-      type: "message_sent",
-      at: new Date().toISOString(),
-      chat_number: lastChat.celular,
-      ok: true,
-      result: data,
-    });
-
-    return res.status(200).json({ ok: true, target: lastChat.celular, lastChat, result: data });
-  } catch (err) {
-    const payload = err?.response?.data || null;
-    const status = err?.response?.status || null;
-
-    counters.sendErrors += 1;
-    counters.lastError = payload || err?.message || String(err);
-
-    appendEvent({
-      type: "message_send_error",
-      at: new Date().toISOString(),
-      ok: false,
-      status,
-      error: counters.lastError,
-    });
-
-    return res.status(500).json({ ok: false, error: counters.lastError, status });
-  }
-});
-
-// inspecionar lastChat (protegido)
+// ====== lastChat protegido ======
 app.get("/last-chat", (req, res) => {
   const auth = requireAdmin(req, res);
   if (auth) return;

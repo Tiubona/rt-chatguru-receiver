@@ -57,6 +57,23 @@ const pool = DATABASE_URL
 // ====== Estado em memória (para TESTE) ======
 let lastChat = null;
 
+// ====== AUTO-REPLY (Gatilho) ======
+const AUTO_TRIGGER_TEXT = "teste"; // NÃO muda a ideia: "Teste" (case-insensitive)
+const AUTO_REPLY_TEXT = "Recebi sua mensagem ✅ Só um segundo que já te respondo aqui.";
+
+// ====== OpenAI (IA) ======
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
+const OPENAI_PROJECT = process.env.OPENAI_PROJECT || null;
+const OPENAI_ORG = process.env.OPENAI_ORG || null;
+
+function requireOpenAIConfig() {
+  const missing = [];
+  if (!OPENAI_API_KEY) missing.push("OPENAI_API_KEY");
+  if (!OPENAI_MODEL) missing.push("OPENAI_MODEL");
+  return missing;
+}
+
 // ====== Helpers ======
 function appendEvent(obj) {
   try {
@@ -175,6 +192,36 @@ async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
   return resp.data;
 }
 
+// ====== OpenAI call (Responses API) ======
+async function openaiCreateReply({ system, user }) {
+  const missing = requireOpenAIConfig();
+  if (missing.length) {
+    throw new Error("Config OpenAI incompleta: " + missing.join(", "));
+  }
+
+  const headers = {
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+  };
+  if (OPENAI_PROJECT) headers["OpenAI-Project"] = OPENAI_PROJECT;
+  if (OPENAI_ORG) headers["OpenAI-Organization"] = OPENAI_ORG;
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/responses",
+    {
+      model: OPENAI_MODEL,
+      input: [
+        { role: "system", content: String(system || "") },
+        { role: "user", content: String(user || "") },
+      ],
+    },
+    { timeout: 20000, headers }
+  );
+
+  const text = resp.data && resp.data.output_text ? String(resp.data.output_text).trim() : "";
+  return text;
+}
+
 // ====== DB bootstrap ======
 async function dbInit() {
   if (!pool) {
@@ -198,8 +245,8 @@ async function dbInit() {
       );
     `);
 
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_events_received_at ON cg_events(received_at);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_events_celular ON cg_events(celular);`);
+    await client.query(\`CREATE INDEX IF NOT EXISTS idx_cg_events_received_at ON cg_events(received_at);\`);
+    await client.query(\`CREATE INDEX IF NOT EXISTS idx_cg_events_celular ON cg_events(celular);\`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS cg_sends (
@@ -212,7 +259,7 @@ async function dbInit() {
       );
     `);
 
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_cg_sends_sent_at ON cg_sends(sent_at);`);
+    await client.query(\`CREATE INDEX IF NOT EXISTS idx_cg_sends_sent_at ON cg_sends(sent_at);\`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS admin_config (
@@ -528,6 +575,29 @@ app.post("/webhook/chatguru", async (req, res) => {
 
   appendEvent(event);
   await dbSaveEvent(body);
+
+  // ====== AUTO-REPLY SOMENTE NO GATILHO "Teste" ======
+  try {
+    const rawText = (body.texto_mensagem || "").toString();
+    const normalized = rawText.trim().toLowerCase();
+
+    if (celular && normalized === AUTO_TRIGGER_TEXT) {
+      const missing = requireChatGuruConfig();
+      if (missing.length) {
+        console.log("⚠️ AUTO-REPLY não enviado (faltam envs ChatGuru):", missing);
+      } else {
+        console.log("🚀 AUTO-REPLY disparado (gatilho Teste) para:", String(celular));
+        const data = await chatGuruSendMessage({
+          chatNumber: String(celular),
+          text: AUTO_REPLY_TEXT,
+        });
+
+        await dbSaveSend({ celular: String(celular), text: AUTO_REPLY_TEXT, source: "auto", result: data });
+      }
+    }
+  } catch (e) {
+    console.log("⚠️ AUTO-REPLY erro:", e?.message || e);
+  }
 
   return res.status(200).json({ ok: true });
 });
@@ -939,6 +1009,39 @@ app.get("/admin/api/stats", async (req, res) => {
   const period = req.query.period || "7d";
   const stats = await getStats(period);
   return res.status(200).json({ ok: true, period, stats });
+});
+
+// ====== OpenAI TEST (JSON) ======
+app.post("/admin/api/ai-test", async (req, res) => {
+  try {
+    // Aceita acesso via token (curl) OU via sessão do painel (cookie)
+    const token = req.headers["x-rt-admin-token"];
+    const okByToken = RT_ADMIN_TOKEN && token === RT_ADMIN_TOKEN;
+    const okBySession = isAdminAuthed(req);
+
+    if (!okByToken && !okBySession) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+
+    const { text, system } = req.body || {};
+    if (!text) return res.status(400).json({ ok: false, error: "Body inválido. Envie { text }" });
+
+    const systemPrompt =
+      (system && String(system).trim()) ||
+      "Você é um atendente humano, rápido, cordial e objetivo. Responda curto. Se faltar info, faça 1 pergunta objetiva.";
+
+    const reply = await openaiCreateReply({
+      system: systemPrompt,
+      user: String(text),
+    });
+
+    return res.status(200).json({ ok: true, model: OPENAI_MODEL, reply });
+  } catch (err) {
+    const status = err?.response?.status || null;
+    const payload = err?.response?.data || null;
+    const msg = payload || err?.message || String(err);
+    return res.status(500).json({ ok: false, error: msg, status });
+  }
 });
 
 // ====== Stats functions ======

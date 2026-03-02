@@ -60,22 +60,27 @@ let lastChat = null;
 // ====== AUTO-REPLY (Gatilho) ======
 const AUTO_TRIGGER_TEXT = "teste"; // "Teste" (case-insensitive)
 
-// Quando a IA estiver ligada, essa mensagem fixa vira fallback
+// Mensagem fixa fallback (quando IA desligada / RTBRAIN ausente)
 const AUTO_REPLY_FALLBACK_TEXT = "Recebi sua mensagem ✅ Só um segundo que já te respondo aqui.";
 
 // ====== OpenAI (IA) ======
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
-// Se você não setar, ele usa gpt-5.2 (pode trocar no Render depois)
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 const OPENAI_PROJECT = process.env.OPENAI_PROJECT || null;
 const OPENAI_ORG = process.env.OPENAI_ORG || null;
 
 // Liga/desliga IA sem alterar código (Render env):
-// AI_ENABLED="true" (padrão: true quando tem chave)
+// AI_ENABLED="false" desliga. Qualquer outro valor = ligado.
 const AI_ENABLED = String(process.env.AI_ENABLED || "").toLowerCase() === "false" ? false : true;
 
 // Tamanho máximo por mensagem (pra evitar textão quebrar no WhatsApp)
 const MAX_WPP_CHARS = process.env.MAX_WPP_CHARS ? Number(process.env.MAX_WPP_CHARS) : 650;
+
+// ====== URA gate (só responde quando bater) ======
+const ALLOWED_URAS = String(process.env.ALLOWED_URAS || "Testechat")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // ====== RTBRAIN (base do robô) ======
 function loadRtBrain() {
@@ -220,8 +225,6 @@ function splitIntoTwoMessages(text, maxChars) {
 
   if (t.length <= maxChars) return [t];
 
-  // tenta quebrar em 2 partes com bom senso
-  // prioridade: dupla quebra de linha, depois linha, depois ponto final
   const breakCandidates = ["\n\n", "\n", ". "];
   let cut = -1;
 
@@ -238,7 +241,6 @@ function splitIntoTwoMessages(text, maxChars) {
   const part1 = t.slice(0, cut).trim();
   const part2 = t.slice(cut).trim();
 
-  // se ainda ficou enorme, corta a segunda (a regra aqui é 2 mensagens)
   if (part2.length > maxChars) {
     return [part1, part2.slice(0, maxChars).trim()];
   }
@@ -254,7 +256,6 @@ async function chatGuruSendPossiblyChunked({ chatNumber, fullText, source }) {
     sentResults.push(data);
     await dbSaveSend({ celular: String(chatNumber), text: parts[i], source: String(source || "auto"), result: data });
 
-    // micro delay entre msg 1 e 2 (evita "colar" / rate limit)
     if (i === 0 && parts.length > 1) {
       await new Promise((r) => setTimeout(r, 900));
     }
@@ -289,11 +290,9 @@ async function openaiCreateReply({ system, user }) {
     { timeout: 20000, headers }
   );
 
-  // Parsing robusto
   const outText = resp?.data?.output_text;
   if (typeof outText === "string") return outText.trim();
 
-  // fallback: tenta achar texto em output[]
   const output = resp?.data?.output;
   if (Array.isArray(output)) {
     let acc = "";
@@ -637,6 +636,59 @@ function escapeHtml(str) {
     .replaceAll("'", "&#039;");
 }
 
+// ====== RTBRAIN System Prompt (TRAVADO) ======
+function buildLockedSystemPrompt() {
+  const base = String(RTBRAIN_TEXT || "").trim();
+
+  // Escopo explícito (pra IA não “viajar”)
+  const scope = `
+ESCOPO PERMITIDO (apenas):
+- Remoção de tatuagem
+- Remoção de micropigmentação de sobrancelha
+- Tratamento de estrias
+- Harmonização facial (Dra. Thay)
+
+PROIBIDO:
+- Responder qualquer coisa fora do escopo (ex.: carros, saúde geral, receitas, dicas de produtos).
+- Inventar informação, sugerir técnicas/medicamentos/procedimentos que não estejam no RTBRAIN.
+- Buscar/usar internet, notícias, referências externas, ou "conhecimento geral" fora do RTBRAIN.
+`;
+
+  const rules = `
+REGRAS DE ESTILO:
+- Soe humano, cordial, direto e curto.
+- 2 a 4 frases.
+- Faça no máximo 1 pergunta objetiva no final (se precisar).
+- Não repita a mesma resposta.
+- Não misture procedimentos.
+- Se o cliente perguntar algo fora do escopo OU algo que não esteja no RTBRAIN:
+  1) diga que vai confirmar com o Rafa/Larissa e retornar
+  2) faça 1 pergunta para trazer para o menu (tatuagem / sobrancelha / estrias / harmonização).
+`;
+
+  const fallbackIfNoBrain = `
+Você é um atendente humano, cordial e objetivo.
+Você só pode responder sobre: tatuagem, sobrancelha, estrias ou harmonização facial.
+Se for fora disso, diga que vai confirmar com Larissa e faça 1 pergunta para o cliente escolher um desses 4.
+`;
+
+  return base ? `${base}\n\n${scope}\n${rules}` : `${fallbackIfNoBrain}\n${scope}\n${rules}`;
+}
+
+function isAllowedUra(body) {
+  const ura = body?.bot_context?.URA || body?.bot_context?.ura || body?.URA || null;
+  if (!ura) return false;
+  return ALLOWED_URAS.includes(String(ura).trim());
+}
+
+function looksLikeOutOfScope(text) {
+  const t = String(text || "").toLowerCase();
+  // Esse filtro é simples e serve como “cinto de segurança”.
+  // A IA também está travada no system prompt.
+  const allowedHints = ["tatu", "sobr", "micro", "estria", "harmon", "botox", "preench", "laser"];
+  return !allowedHints.some((h) => t.includes(h));
+}
+
 // ====== Rotas base ======
 app.get("/", (_req, res) => res.status(200).json({ ok: true, service: "rt-chatguru-receiver" }));
 app.get("/health", (_req, res) => res.status(200).json({ status: "online" }));
@@ -669,6 +721,7 @@ app.post("/webhook/chatguru", async (req, res) => {
       origem: body.origem ? String(body.origem) : null,
       texto_mensagem: body.texto_mensagem ? String(body.texto_mensagem) : null,
       tipo_mensagem: body.tipo_mensagem ? String(body.tipo_mensagem) : null,
+      _lastSig: lastChat?._lastSig || null,
     };
 
     console.log("=== lastChat atualizado ===");
@@ -680,79 +733,88 @@ app.post("/webhook/chatguru", async (req, res) => {
   appendEvent(event);
   await dbSaveEvent(body);
 
-// ====== AUTO-REPLY / AI REPLY ======
-try {
-  const rawText = (body.texto_mensagem || "").toString();
-  const normalized = rawText.trim().toLowerCase();
-  const tipo = (body.tipo_mensagem || "").toString().toLowerCase();
+  // ====== AUTO-REPLY / AI REPLY (TRAVADO) ======
+  try {
+    const rawText = (body.texto_mensagem || "").toString();
+    const normalized = rawText.trim().toLowerCase();
+    const tipo = (body.tipo_mensagem || "").toString().toLowerCase();
 
-  // Só responde chat "humano"
-  if (!celular || !rawText.trim() || tipo !== "chat") {
-    // ignora eventos vazios/sistema
-    return res.status(200).json({ ok: true });
+    // Só responde chat "humano"
+    if (!celular || !rawText.trim() || tipo !== "chat") {
+      return res.status(200).json({ ok: true, ignored: "non-chat-or-empty" });
+    }
+
+    // Só responde quando URA for permitida (ex.: Testechat)
+    if (!isAllowedUra(body)) {
+      console.log("🧱 URA não permitida — ignorando. URA =", body?.bot_context?.URA);
+      return res.status(200).json({ ok: true, ignored: "ura_not_allowed" });
+    }
+
+    // --- trava anti-duplicação ---
+    const sig = `${body.chat_id || ""}::${rawText.trim()}::${body.datetime_post || event.receivedAt || ""}`;
+    if (lastChat && lastChat._lastSig === sig) {
+      console.log("🔁 Evento duplicado - ignorado:", sig);
+      return res.status(200).json({ ok: true, duplicate: true });
+    }
+    if (lastChat) lastChat._lastSig = sig;
+
+    // --- modo “teste” opcional (mantém o gatilho) ---
+    const forceTest = normalized === AUTO_TRIGGER_TEXT;
+
+    // Robô ligado de verdade: responde sempre (desde que URA permitida)
+    const SHOULD_REPLY = true;
+
+    if (!SHOULD_REPLY && !forceTest) {
+      console.log("🛑 SHOULD_REPLY=false e não foi gatilho 'teste'. Ignorando.");
+      return res.status(200).json({ ok: true, ignored: "should_reply_false" });
+    }
+
+    const missingCG = requireChatGuruConfig();
+    if (missingCG.length) {
+      console.log("⚠️ Não respondeu (faltam envs ChatGuru):", missingCG);
+      return res.status(200).json({ ok: true, warn: "missing_chatguru_env", missingCG });
+    }
+
+    const missingAI = requireOpenAIConfig();
+    const canUseAI = AI_ENABLED && missingAI.length === 0;
+
+    // Se IA não puder, envia fallback
+    if (!canUseAI) {
+      console.log("⚠️ IA desligada ou sem chave. Enviando fallback.");
+      await chatGuruSendPossiblyChunked({
+        chatNumber: String(celular),
+        fullText: AUTO_REPLY_FALLBACK_TEXT,
+        source: "auto",
+      });
+      return res.status(200).json({ ok: true, fallback: true });
+    }
+
+    // Cinto adicional: se claramente fora do escopo, já manda fallback “confirmar com Rafa”
+    // (A IA também tem regra, mas aqui evita gastar token à toa em “carros”)
+    if (looksLikeOutOfScope(rawText)) {
+      const out = `Entendi. Essa dúvida foge do que eu tenho aqui agora — vou confirmar com o Rafa/Larissa e já te retorno. 😉\n\nPra eu te ajudar no que é da RT: é sobre tatuagem, sobrancelha, estrias ou harmonização?`;
+      await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: out, source: "scope" });
+      return res.status(200).json({ ok: true, out_of_scope: true });
+    }
+
+    const systemPrompt = buildLockedSystemPrompt();
+
+    const reply = await openaiCreateReply({
+      system: systemPrompt,
+      user: rawText,
+    });
+
+    const finalText = String(reply || "").trim() || AUTO_REPLY_FALLBACK_TEXT;
+
+    await chatGuruSendPossiblyChunked({
+      chatNumber: String(celular),
+      fullText: finalText,
+      source: "ai",
+    });
+
+  } catch (e) {
+    console.log("⚠️ AI/AUTO-REPLY erro:", e?.message || e);
   }
-
-  // --- trava anti-duplicação (memória) ---
-  // assinatura baseada em chat_id + texto + datetime_post (ou receivedAt)
-  const sig = `${body.chat_id || ""}::${rawText.trim()}::${body.datetime_post || event.receivedAt || ""}`;
-
-  // guarda no lastChat também (rápido e simples)
-  if (lastChat && lastChat._lastSig === sig) {
-    console.log("🔁 Evento duplicado - ignorado:", sig);
-    return res.status(200).json({ ok: true, duplicate: true });
-  }
-  if (lastChat) lastChat._lastSig = sig;
-
-  // --- modo “teste” opcional ---
-  const forceTest = normalized === AUTO_TRIGGER_TEXT; // "teste"
-
-  // Se você quiser que responda SEMPRE, deixe a condição true.
-  // Se você quiser responder só no "teste", deixe forceTest.
-  const SHOULD_REPLY = true; // <<< aqui liga o robô de verdade
-
-  if (!SHOULD_REPLY && !forceTest) {
-    console.log("🛑 SHOULD_REPLY=false e não foi gatilho 'teste'. Ignorando.");
-    return res.status(200).json({ ok: true });
-  }
-
-  // --- IA responde ---
-  const missingCG = requireChatGuruConfig();
-  if (missingCG.length) {
-    console.log("⚠️ Não respondeu (faltam envs ChatGuru):", missingCG);
-    return res.status(200).json({ ok: true, warn: "missing_chatguru_env" });
-  }
-
-  const missingAI = requireOpenAIConfig();
-  const canUseAI = AI_ENABLED && missingAI.length === 0;
-
-  if (!canUseAI) {
-    console.log("⚠️ IA desligada ou sem chave. Enviando fallback.");
-    const data = await chatGuruSendMessage({ chatNumber: String(celular), text: AUTO_REPLY_TEXT });
-    await dbSaveSend({ celular: String(celular), text: AUTO_REPLY_TEXT, source: "auto", result: data });
-    return res.status(200).json({ ok: true });
-  }
-
-  const systemPrompt =
-    "Você é um atendente humano, rápido, cordial e objetivo. " +
-    "Responda curto. Se faltar info, faça 1 pergunta objetiva. " +
-    "Nunca repita a resposta duas vezes.";
-
-  const reply = await openaiCreateReply({
-    system: systemPrompt,
-    user: rawText,
-  });
-
-  const finalText = (reply || "").trim() || AUTO_REPLY_TEXT;
-
-  const data = await chatGuruSendMessage({
-    chatNumber: String(celular),
-    text: finalText,
-  });
-
-  await dbSaveSend({ celular: String(celular), text: finalText, source: "ai", result: data });
-} catch (e) {
-  console.log("⚠️ AI/AUTO-REPLY erro:", e?.message || e);
-}
 
   return res.status(200).json({ ok: true });
 });
@@ -881,9 +943,9 @@ app.get("/admin", async (req, res) => {
 
   const dbBadge = pool ? `<span class="badge ok">DB OK</span>` : `<span class="badge bad">DB OFF</span>`;
   const emailBadge = canEmail() ? `<span class="badge ok">EMAIL OK</span>` : `<span class="badge bad">EMAIL OFF</span>`;
-  const aiBadge =
-    AI_ENABLED && OPENAI_API_KEY ? `<span class="badge ok">IA ON</span>` : `<span class="badge bad">IA OFF</span>`;
+  const aiBadge = AI_ENABLED && OPENAI_API_KEY ? `<span class="badge ok">IA ON</span>` : `<span class="badge bad">IA OFF</span>`;
   const brainBadge = RTBRAIN_TEXT ? `<span class="badge ok">RTBRAIN OK</span>` : `<span class="badge bad">RTBRAIN OFF</span>`;
+  const uraBadge = `<span class="badge ok">URA=${escapeHtml(ALLOWED_URAS.join(","))}</span>`;
 
   const stats = await getStats("30d");
 
@@ -902,6 +964,7 @@ app.get("/admin", async (req, res) => {
               ${emailBadge}
               ${aiBadge}
               ${brainBadge}
+              ${uraBadge}
             </div>
           </div>
         </div>
@@ -1180,22 +1243,24 @@ app.post("/admin/api/ai-test", async (req, res) => {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
 
-    const { text, system } = req.body || {};
+    const { text } = req.body || {};
     if (!text) return res.status(400).json({ ok: false, error: "Body inválido. Envie { text }" });
 
-    const base = RTBRAIN_TEXT || "";
-    const systemPrompt =
-      (system && String(system).trim()) ||
-      (base
-        ? `${base}\n\nREGRAS TÉCNICAS IMPORTANTES:\n- Nunca repita a mesma resposta duas vezes.\n- Seja direto, humano e curto.\n- Se faltar informação essencial, faça apenas 1 pergunta objetiva.\n`
-        : "Você é um atendente humano, rápido, cordial e objetivo. Responda curto. Se faltar info, faça 1 pergunta objetiva.");
+    const missingAI = requireOpenAIConfig();
+    const canUseAI = AI_ENABLED && missingAI.length === 0;
+
+    if (!canUseAI) {
+      return res.status(200).json({ ok: true, model: OPENAI_MODEL, reply: AUTO_REPLY_FALLBACK_TEXT, note: "AI disabled or missing key" });
+    }
+
+    const systemPrompt = buildLockedSystemPrompt();
 
     const reply = await openaiCreateReply({
       system: systemPrompt,
       user: String(text),
     });
 
-    return res.status(200).json({ ok: true, model: OPENAI_MODEL, reply });
+    return res.status(200).json({ ok: true, model: OPENAI_MODEL, reply: String(reply || "").trim() });
   } catch (err) {
     const status = err?.response?.status || null;
     const payload = err?.response?.data || null;
@@ -1276,6 +1341,6 @@ async function getTrainingRows() {
   app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log(`Admin: /admin/login`);
-    console.log(`AI_ENABLED=${AI_ENABLED} | MODEL=${OPENAI_MODEL} | RTBRAIN=${RTBRAIN_TEXT ? "loaded" : "missing"}`);
+    console.log(`AI_ENABLED=${AI_ENABLED} | MODEL=${OPENAI_MODEL} | RTBRAIN=${RTBRAIN_TEXT ? "loaded" : "missing"} | ALLOWED_URAS=${ALLOWED_URAS.join(",")}`);
   });
 })();

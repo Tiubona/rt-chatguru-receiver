@@ -362,6 +362,32 @@ async function cfgSet(key, valueJson) {
   );
 }
 
+// ✅ NOVO: buscar histórico recente do chat para dar contexto pra IA
+async function getRecentChatHistory(celular, limit = 10) {
+  if (!pool) return [];
+  try {
+    const r = await pool.query(
+      `
+      SELECT received_at::text AS at, texto_mensagem AS text
+      FROM cg_events
+      WHERE celular = $1
+        AND tipo_mensagem = 'chat'
+        AND texto_mensagem IS NOT NULL
+        AND length(trim(texto_mensagem)) > 0
+      ORDER BY received_at DESC
+      LIMIT $2
+      `,
+      [String(celular), Number(limit)]
+    );
+
+    const rows = r.rows || [];
+    return rows.reverse(); // deixa em ordem "antigo -> novo"
+  } catch (e) {
+    console.log("DB: erro buscando histórico:", e?.message || e);
+    return [];
+  }
+}
+
 // ====== Email alerts ======
 function canEmail() {
   return !!(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS && SMTP_FROM);
@@ -668,15 +694,17 @@ app.post("/webhook/chatguru", async (req, res) => {
       return res.status(200).json({ ok: true, fallback: true });
     }
 
-    // Cinto adicional: se claramente fora do escopo, já manda fallback “confirmar com Rafa”
-    // (A IA também tem regra, mas aqui evita gastar token à toa em “carros”)
+    // Cinto adicional: se claramente fora do escopo, já manda fallback
     if (ai.looksLikeOutOfScope(rawText)) {
       const out = `Entendi. Essa dúvida foge do que eu tenho aqui agora — vou confirmar com a Larissa e já te retorno. 😉\n\nPra eu te ajudar no que é da RT: é sobre tatuagem, sobrancelha, estrias ou harmonização?`;
       await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: out, source: "scope" });
       return res.status(200).json({ ok: true, out_of_scope: true });
     }
 
-    const reply = await ai.generateLockedReply(rawText);
+    // ✅ NOVO: histórico curto para dar contexto
+    const history = await getRecentChatHistory(String(celular), 10);
+
+    const reply = await ai.generateLockedReply(rawText, history);
 
     const finalText = String(reply || "").trim() || AUTO_REPLY_FALLBACK_TEXT;
 
@@ -1012,7 +1040,7 @@ app.post("/admin/alerts", async (req, res) => {
   return res.redirect("/admin/alerts");
 });
 
-// Treino IA (futuro)
+// Treino IA
 app.get("/admin/training", async (req, res) => {
   if (!requireAdminSession(req, res)) return;
 
@@ -1023,7 +1051,7 @@ app.get("/admin/training", async (req, res) => {
     ${shell}
     <div class="grid">
       <div class="card">
-        <div class="title" style="font-size:16px;">Treino IA (futuro)</div>
+        <div class="title" style="font-size:16px;">Treino IA</div>
         <div class="hint">Aqui você cadastra exemplos do jeito que você quer que a IA responda depois.</div>
       </div>
 
@@ -1127,7 +1155,8 @@ app.post("/admin/api/ai-test", async (req, res) => {
         .json({ ok: true, model: ai.OPENAI_MODEL, reply: AUTO_REPLY_FALLBACK_TEXT, note: "AI disabled or missing key" });
     }
 
-    const reply = await ai.generateLockedReply(String(text));
+    // ✅ aqui também dá pra passar histórico se quiser, mas no teste não precisa
+    const reply = await ai.generateLockedReply(String(text), []);
 
     return res.status(200).json({ ok: true, model: ai.OPENAI_MODEL, reply: String(reply || "").trim() });
   } catch (err) {

@@ -2,6 +2,7 @@
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
+const { Pool } = require("pg");
 
 // ====== OpenAI (IA) ======
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
@@ -13,13 +14,20 @@ const OPENAI_ORG = process.env.OPENAI_ORG || null;
 // AI_ENABLED="false" desliga. Qualquer outro valor = ligado.
 const AI_ENABLED = String(process.env.AI_ENABLED || "").toLowerCase() === "false" ? false : true;
 
+// ====== DB (para buscar treino) ======
+const DATABASE_URL = process.env.DATABASE_URL || null;
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSLMODE ? { rejectUnauthorized: false } : undefined,
+    })
+  : null;
+
 // ====== RTBRAIN (base do robô) ======
 function loadRtBrain() {
   try {
     const p = path.join(__dirname, "rtbrain.txt");
-    if (fs.existsSync(p)) {
-      return fs.readFileSync(p, "utf8");
-    }
+    if (fs.existsSync(p)) return fs.readFileSync(p, "utf8");
   } catch (_) {}
   return null;
 }
@@ -38,11 +46,63 @@ function canUseAI() {
   return AI_ENABLED && missingAI.length === 0;
 }
 
+// ====== Treino: buscar exemplos do banco ======
+function tokenize(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 4)
+    .slice(0, 10);
+}
+
+async function getTrainingExamples(userText, limit = 6) {
+  if (!pool) return [];
+
+  const words = tokenize(userText);
+  // Se não tem palavras boas, pega os últimos exemplos cadastrados
+  if (!words.length) {
+    const r = await pool.query(
+      `SELECT tag, user_text, ideal_answer
+       FROM ai_training
+       ORDER BY id DESC
+       LIMIT $1`,
+      [limit]
+    );
+    return r.rows || [];
+  }
+
+  // Busca simples por ILIKE (MVP)
+  const likes = words.map((w) => `%${w}%`);
+  const params = [];
+  let where = [];
+
+  likes.forEach((lk, i) => {
+    params.push(lk);
+    const p = `$${params.length}`;
+    where.push(`user_text ILIKE ${p} OR tag ILIKE ${p}`);
+  });
+
+  params.push(limit);
+  const limitParam = `$${params.length}`;
+
+  const r = await pool.query(
+    `SELECT tag, user_text, ideal_answer
+     FROM ai_training
+     WHERE ${where.join(" OR ")}
+     ORDER BY id DESC
+     LIMIT ${limitParam}`,
+    params
+  );
+
+  return r.rows || [];
+}
+
 // ====== RTBRAIN System Prompt (TRAVADO) ======
-function buildLockedSystemPrompt() {
+function buildLockedSystemPrompt(examples, historyBlockText) {
   const base = String(RTBRAIN_TEXT || "").trim();
 
-  // Escopo explícito (pra IA não “viajar”)
   const scope = `
 ESCOPO PERMITIDO (apenas):
 - Remoção de tatuagem
@@ -51,9 +111,9 @@ ESCOPO PERMITIDO (apenas):
 - Harmonização facial (Dra. Thay)
 
 PROIBIDO:
-- Responder qualquer coisa fora do escopo (ex.: carros, saúde geral, receitas, dicas de produtos).
+- Responder qualquer coisa fora do escopo.
 - Inventar informação, sugerir técnicas/medicamentos/procedimentos que não estejam no RTBRAIN.
-- Buscar/usar internet, notícias, referências externas, ou "conhecimento geral" fora do RTBRAIN.
+- Usar internet ou conhecimento externo fora do RTBRAIN.
 `;
 
   const rules = `
@@ -63,7 +123,7 @@ REGRAS DE ESTILO:
 - Faça no máximo 1 pergunta objetiva no final (se precisar).
 - Não repita a mesma resposta.
 - Não misture procedimentos.
-- Se o cliente perguntar algo fora do escopo OU algo que não esteja no RTBRAIN:
+- Se for fora do escopo OU algo que não esteja no RTBRAIN:
   1) diga que vai confirmar com a Larissa e retornar
   2) faça 1 pergunta para trazer para o menu (tatuagem / sobrancelha / estrias / harmonização).
 `;
@@ -74,45 +134,94 @@ Você só pode responder sobre: tatuagem, sobrancelha, estrias ou harmonização
 Se for fora disso, diga que vai confirmar com Larissa e faça 1 pergunta para o cliente escolher um desses 4.
 `;
 
-  return base ? `${base}\n\n${scope}\n${rules}` : `${fallbackIfNoBrain}\n${scope}\n${rules}`;
+  const ex =
+    Array.isArray(examples) && examples.length
+      ? `
+EXEMPLOS (use como referência de tom/estrutura quando fizer sentido):
+${examples
+  .slice(0, 6)
+  .map((e, i) => {
+    const tag = e.tag ? ` [${String(e.tag)}]` : "";
+    return `(${i + 1}) Cliente${tag}: ${String(e.user_text || "").trim()}
+Resposta ideal: ${String(e.ideal_answer || "").trim()}`;
+  })
+  .join("\n\n")}
+`
+      : "";
+
+  const history =
+    historyBlockText
+      ? `
+CONTEXTO DO CHAT (mais recente por último):
+${String(historyBlockText).trim()}
+`
+      : "";
+
+  const head = base ? base : fallbackIfNoBrain;
+  return `${head}\n\n${scope}\n${rules}\n${history}\n${ex}`.trim();
 }
 
+// ✅ Corrigido: NÃO bloquear mensagem curta (WhatsApp é telegráfico)
 function looksLikeOutOfScope(text) {
-  const t = String(text || "").toLowerCase();
-  // Esse filtro é simples e serve como “cinto de segurança”.
-  // A IA também está travada no system prompt.
+  const t = String(text || "").toLowerCase().trim();
+
+  // Mensagens curtas normalmente são continuação do contexto
+  if (t.length <= 20) return false;
+
+  // Se tem pista clara do nosso escopo, OK
   const allowedHints = ["tatu", "sobr", "micro", "estria", "harmon", "botox", "preench", "laser"];
-  return !allowedHints.some((h) => t.includes(h));
+  if (allowedHints.some((h) => t.includes(h))) return false;
+
+  // Fora do escopo só se tiver sinais fortes de outro assunto
+  const off = [
+    "carro",
+    "moto",
+    "ipva",
+    "receita",
+    "bitcoin",
+    "bet",
+    "jogo",
+    "política",
+    "eleição",
+    "dor no peito",
+    "remédio",
+    "medicamento",
+    "diagnóstico",
+    "advogado",
+  ];
+  return off.some((w) => t.includes(w));
 }
 
 // ====== OpenAI call (Responses API) ======
 async function openaiCreateReply({ system, user }) {
   const missing = requireOpenAIConfig();
-  if (missing.length) {
-    throw new Error("Config OpenAI incompleta: " + missing.join(", "));
-  }
+  if (missing.length) throw new Error("Config OpenAI incompleta: " + missing.join(", "));
 
   const headers = {
     Authorization: `Bearer ${OPENAI_API_KEY}`,
     "Content-Type": "application/json",
   };
+
   if (OPENAI_PROJECT) headers["OpenAI-Project"] = OPENAI_PROJECT;
   if (OPENAI_ORG) headers["OpenAI-Organization"] = OPENAI_ORG;
 
-  const resp = await axios.post(
-    "https://api.openai.com/v1/responses",
-    {
-      model: OPENAI_MODEL,
-      input: [
-        { role: "system", content: String(system || "") },
-        { role: "user", content: String(user || "") },
-      ],
-    },
-    { timeout: 20000, headers }
-  );
+  const payload = {
+    model: OPENAI_MODEL,
+    input: [
+      {
+        role: "system",
+        content: [{ type: "input_text", text: String(system || "") }],
+      },
+      {
+        role: "user",
+        content: [{ type: "input_text", text: String(user || "") }],
+      },
+    ],
+  };
 
-  const outText = resp?.data?.output_text;
-  if (typeof outText === "string") return outText.trim();
+  const resp = await axios.post("https://api.openai.com/v1/responses", payload, { timeout: 20000, headers });
+
+  if (typeof resp?.data?.output_text === "string") return resp.data.output_text.trim();
 
   const output = resp?.data?.output;
   if (Array.isArray(output)) {
@@ -121,8 +230,7 @@ async function openaiCreateReply({ system, user }) {
       const content = item?.content;
       if (Array.isArray(content)) {
         for (const c of content) {
-          if (c?.type === "output_text" && typeof c?.text === "string") acc += c.text;
-          if (c?.type === "text" && typeof c?.text === "string") acc += c.text;
+          if ((c?.type === "output_text" || c?.type === "text") && typeof c?.text === "string") acc += c.text;
         }
       }
     }
@@ -132,9 +240,21 @@ async function openaiCreateReply({ system, user }) {
   return "";
 }
 
-// ====== Engine (1 função “principal” que o server usa) ======
-async function generateLockedReply(userText) {
-  const systemPrompt = buildLockedSystemPrompt();
+// ====== Engine (principal) ======
+async function generateLockedReply(userText, history = []) {
+  const examples = await getTrainingExamples(userText, 6);
+
+  const historyBlockText =
+    Array.isArray(history) && history.length
+      ? history
+          .slice(-12)
+          .map((h) => `- ${String(h.text || "").trim()}`)
+          .filter(Boolean)
+          .join("\n")
+      : "";
+
+  const systemPrompt = buildLockedSystemPrompt(examples, historyBlockText);
+
   return await openaiCreateReply({
     system: systemPrompt,
     user: String(userText || ""),
@@ -142,18 +262,15 @@ async function generateLockedReply(userText) {
 }
 
 module.exports = {
-  // status/consts
   AI_ENABLED,
   OPENAI_MODEL,
   RTBRAIN_TEXT,
 
-  // helpers
   requireOpenAIConfig,
   canUseAI,
   buildLockedSystemPrompt,
   looksLikeOutOfScope,
 
-  // core
   openaiCreateReply,
   generateLockedReply,
 };

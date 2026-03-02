@@ -3,4 +3,3 @@ node_modules
 events.jsonl
 *.save
 .env
-public/

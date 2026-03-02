@@ -662,7 +662,7 @@ REGRAS DE ESTILO:
 - Não repita a mesma resposta.
 - Não misture procedimentos.
 - Se o cliente perguntar algo fora do escopo OU algo que não esteja no RTBRAIN:
-  1) diga que vai confirmar com o Rafa/Larissa e retornar
+  1) diga que vai confirmar com a Larissa e retornar
   2) faça 1 pergunta para trazer para o menu (tatuagem / sobrancelha / estrias / harmonização).
 `;
 
@@ -792,7 +792,7 @@ app.post("/webhook/chatguru", async (req, res) => {
     // Cinto adicional: se claramente fora do escopo, já manda fallback “confirmar com Rafa”
     // (A IA também tem regra, mas aqui evita gastar token à toa em “carros”)
     if (looksLikeOutOfScope(rawText)) {
-      const out = `Entendi. Essa dúvida foge do que eu tenho aqui agora — vou confirmar com o Rafa/Larissa e já te retorno. 😉\n\nPra eu te ajudar no que é da RT: é sobre tatuagem, sobrancelha, estrias ou harmonização?`;
+      const out = `Entendi. Essa dúvida foge do que eu tenho aqui agora — vou confirmar com a Larissa e já te retorno. 😉\n\nPra eu te ajudar no que é da RT: é sobre tatuagem, sobrancelha, estrias ou harmonização?`;
       await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: out, source: "scope" });
       return res.status(200).json({ ok: true, out_of_scope: true });
     }

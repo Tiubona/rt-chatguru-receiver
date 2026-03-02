@@ -58,21 +58,36 @@ const pool = DATABASE_URL
 let lastChat = null;
 
 // ====== AUTO-REPLY (Gatilho) ======
-const AUTO_TRIGGER_TEXT = "teste"; // NÃO muda a ideia: "Teste" (case-insensitive)
-const AUTO_REPLY_TEXT = "Recebi sua mensagem ✅ Só um segundo que já te respondo aqui.";
+const AUTO_TRIGGER_TEXT = "teste"; // "Teste" (case-insensitive)
+
+// Quando a IA estiver ligada, essa mensagem fixa vira fallback
+const AUTO_REPLY_FALLBACK_TEXT = "Recebi sua mensagem ✅ Só um segundo que já te respondo aqui.";
 
 // ====== OpenAI (IA) ======
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
+// Se você não setar, ele usa gpt-5.2 (pode trocar no Render depois)
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 const OPENAI_PROJECT = process.env.OPENAI_PROJECT || null;
 const OPENAI_ORG = process.env.OPENAI_ORG || null;
 
-function requireOpenAIConfig() {
-  const missing = [];
-  if (!OPENAI_API_KEY) missing.push("OPENAI_API_KEY");
-  if (!OPENAI_MODEL) missing.push("OPENAI_MODEL");
-  return missing;
+// Liga/desliga IA sem alterar código (Render env):
+// AI_ENABLED="true" (padrão: true quando tem chave)
+const AI_ENABLED = String(process.env.AI_ENABLED || "").toLowerCase() === "false" ? false : true;
+
+// Tamanho máximo por mensagem (pra evitar textão quebrar no WhatsApp)
+const MAX_WPP_CHARS = process.env.MAX_WPP_CHARS ? Number(process.env.MAX_WPP_CHARS) : 650;
+
+// ====== RTBRAIN (base do robô) ======
+function loadRtBrain() {
+  try {
+    const p = path.join(__dirname, "rtbrain.txt");
+    if (fs.existsSync(p)) {
+      return fs.readFileSync(p, "utf8");
+    }
+  } catch (_) {}
+  return null;
 }
+const RTBRAIN_TEXT = loadRtBrain();
 
 // ====== Helpers ======
 function appendEvent(obj) {
@@ -93,6 +108,13 @@ function requireChatGuruConfig() {
   if (!CHATGURU_API_KEY) missing.push("CHATGURU_API_KEY");
   if (!CHATGURU_ACCOUNT_ID) missing.push("CHATGURU_ACCOUNT_ID");
   if (!CHATGURU_PHONE_ID) missing.push("CHATGURU_PHONE_ID");
+  return missing;
+}
+
+function requireOpenAIConfig() {
+  const missing = [];
+  if (!OPENAI_API_KEY) missing.push("OPENAI_API_KEY");
+  if (!OPENAI_MODEL) missing.push("OPENAI_MODEL");
   return missing;
 }
 
@@ -135,7 +157,6 @@ function setCookie(res, name, value, opts = {}) {
 }
 
 function clearCookie(res, name) {
-  // expira imediatamente
   res.setHeader("Set-Cookie", `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax`);
 }
 
@@ -169,6 +190,7 @@ function requireAdminSession(req, res) {
   return true;
 }
 
+// ====== ChatGuru Send ======
 async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
   const params = new URLSearchParams({
     key: CHATGURU_API_KEY,
@@ -183,7 +205,6 @@ async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
 
   const requestUrl = `${CHATGURU_API_ENDPOINT}?${params.toString()}`;
 
-  // Log seguro
   const safeUrl = requestUrl.replace(/key=[^&]+/i, `key=${encodeURIComponent(maskKey(CHATGURU_API_KEY))}`);
   console.log("=== ChatGuru request (safe) ===");
   console.log(safeUrl);
@@ -192,84 +213,54 @@ async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
   return resp.data;
 }
 
-// ====== OpenAI helpers ======
-function extractOpenAIText(data) {
-  try {
-    if (!data) return "";
-    if (typeof data.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+// ====== 2-part send (para evitar corte) ======
+function splitIntoTwoMessages(text, maxChars) {
+  const t = String(text || "").trim();
+  if (!t) return [""];
 
-    // fallback: percorre output[].content[]
-    const output = data.output;
-    if (!Array.isArray(output)) return "";
+  if (t.length <= maxChars) return [t];
 
-    const chunks = [];
-    for (const item of output) {
-      if (!item || item.type !== "message") continue;
-      const content = item.content;
-      if (!Array.isArray(content)) continue;
+  // tenta quebrar em 2 partes com bom senso
+  // prioridade: dupla quebra de linha, depois linha, depois ponto final
+  const breakCandidates = ["\n\n", "\n", ". "];
+  let cut = -1;
 
-      for (const c of content) {
-        // formatos possíveis
-        if (c && typeof c.text === "string" && c.text.trim()) chunks.push(c.text);
-        if (c && c.text && typeof c.text.value === "string" && c.text.value.trim()) chunks.push(c.text.value);
-      }
+  for (const sep of breakCandidates) {
+    const idx = t.lastIndexOf(sep, maxChars);
+    if (idx > 80) {
+      cut = idx + sep.length;
+      break;
     }
-
-    return chunks.join("\n").trim();
-  } catch (_) {
-    return "";
   }
+
+  if (cut === -1) cut = maxChars;
+
+  const part1 = t.slice(0, cut).trim();
+  const part2 = t.slice(cut).trim();
+
+  // se ainda ficou enorme, corta a segunda (a regra aqui é 2 mensagens)
+  if (part2.length > maxChars) {
+    return [part1, part2.slice(0, maxChars).trim()];
+  }
+  return [part1, part2];
 }
 
-// ====== OpenAI helpers ======
-function extractResponseText(data) {
-  if (!data) return "";
+async function chatGuruSendPossiblyChunked({ chatNumber, fullText, source }) {
+  const parts = splitIntoTwoMessages(fullText, MAX_WPP_CHARS).filter((p) => p && p.trim());
+  const sentResults = [];
 
-  const pieces = [];
+  for (let i = 0; i < parts.length; i++) {
+    const data = await chatGuruSendMessage({ chatNumber, text: parts[i] });
+    sentResults.push(data);
+    await dbSaveSend({ celular: String(chatNumber), text: parts[i], source: String(source || "auto"), result: data });
 
-  // 1) output_text direto (quando vier)
-  if (typeof data.output_text === "string" && data.output_text.trim()) {
-    pieces.push(data.output_text.trim());
-  }
-
-  // 2) output -> content
-  const out = Array.isArray(data.output) ? data.output : [];
-  for (const item of out) {
-    const content = Array.isArray(item?.content) ? item.content : [];
-    for (const c of content) {
-      if (c?.type === "output_text" && typeof c.text === "string" && c.text.trim()) {
-        pieces.push(c.text.trim());
-      } else if (typeof c?.text === "string" && c.text.trim()) {
-        pieces.push(c.text.trim());
-      }
+    // micro delay entre msg 1 e 2 (evita "colar" / rate limit)
+    if (i === 0 && parts.length > 1) {
+      await new Promise((r) => setTimeout(r, 900));
     }
   }
 
-  // Dedup: remove repetições exatas e também caso o texto final tenha sido concatenado 2x
-  const uniq = [];
-  const seen = new Set();
-  for (const p of pieces) {
-    const key = p.replace(/\s+/g, " ").trim(); // normaliza espaço
-    if (!key) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    uniq.push(p);
-  }
-
-  // Se por acaso ainda vier duplicado colado (A\nA), resolve por heurística simples
-  let result = uniq.join("\n").trim();
-
-  // Remove duplicação “bloco inteiro repetido”
-  const half = Math.floor(result.length / 2);
-  if (result.length > 40) {
-    const a = result.slice(0, half).trim();
-    const b = result.slice(half).trim();
-    if (a && b && (a === b || a.replace(/\s+/g, " ") === b.replace(/\s+/g, " "))) {
-      result = a;
-    }
-  }
-
-  return result.trim();
+  return sentResults;
 }
 
 // ====== OpenAI call (Responses API) ======
@@ -286,34 +277,41 @@ async function openaiCreateReply({ system, user }) {
   if (OPENAI_PROJECT) headers["OpenAI-Project"] = OPENAI_PROJECT;
   if (OPENAI_ORG) headers["OpenAI-Organization"] = OPENAI_ORG;
 
-  // Mantém simples e compatível: manda um input string único (docs oficiais fazem assim)
-  const inputText =
-    `SISTEMA:\n${String(system || "").trim()}\n\n` +
-    `CLIENTE:\n${String(user || "").trim()}\n\n` +
-    `Responda somente com a mensagem final para o cliente.`;
-
   const resp = await axios.post(
     "https://api.openai.com/v1/responses",
     {
       model: OPENAI_MODEL,
-      input: inputText,
-      // deixa “chat rápido” por padrão
-      reasoning: { effort: "none" },
-      max_output_tokens: 220,
+      input: [
+        { role: "system", content: String(system || "") },
+        { role: "user", content: String(user || "") },
+      ],
     },
-    { timeout: 30000, headers }
+    { timeout: 20000, headers }
   );
 
-  const reply = extractResponseText(resp.data);
+  // Parsing robusto
+  const outText = resp?.data?.output_text;
+  if (typeof outText === "string") return outText.trim();
 
-  // Se ainda vier vazio, devolve um erro explícito pra você enxergar no curl
-  if (!reply) {
-    console.log("⚠️ OpenAI retornou sem texto. Debug resp.data:");
-    console.log(JSON.stringify(resp.data, null, 2));
+  // fallback: tenta achar texto em output[]
+  const output = resp?.data?.output;
+  if (Array.isArray(output)) {
+    let acc = "";
+    for (const item of output) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (c?.type === "output_text" && typeof c?.text === "string") acc += c.text;
+          if (c?.type === "text" && typeof c?.text === "string") acc += c.text;
+        }
+      }
+    }
+    return String(acc || "").trim();
   }
 
-  return reply;
+  return "";
 }
+
 // ====== DB bootstrap ======
 async function dbInit() {
   if (!pool) {
@@ -346,7 +344,7 @@ async function dbInit() {
         sent_at TIMESTAMPTZ NOT NULL,
         celular TEXT NOT NULL,
         text TEXT NOT NULL,
-        source TEXT NOT NULL, -- send-test | reply-last | auto
+        source TEXT NOT NULL, -- send-test | reply-last | auto | ai
         result JSONB
       );
     `);
@@ -448,7 +446,7 @@ function getMailer() {
   return nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
-    secure: SMTP_PORT === 465, // 465 secure
+    secure: SMTP_PORT === 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
   });
 }
@@ -625,6 +623,20 @@ function adminFooter() {
   return `</div>`;
 }
 
+function short(s) {
+  const t = (s || "").toString();
+  return t.length > 70 ? t.slice(0, 70) + "…" : t;
+}
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
 // ====== Rotas base ======
 app.get("/", (_req, res) => res.status(200).json({ ok: true, service: "rt-chatguru-receiver" }));
 app.get("/health", (_req, res) => res.status(200).json({ status: "online" }));
@@ -668,23 +680,51 @@ app.post("/webhook/chatguru", async (req, res) => {
   appendEvent(event);
   await dbSaveEvent(body);
 
-  // ====== AUTO-REPLY SOMENTE NO GATILHO "Teste" ======
+  // ====== AUTO-REPLY NO GATILHO "Teste" ======
   try {
     const rawText = (body.texto_mensagem || "").toString();
     const normalized = rawText.trim().toLowerCase();
 
     if (celular && normalized === AUTO_TRIGGER_TEXT) {
-      const missing = requireChatGuruConfig();
-      if (missing.length) {
-        console.log("⚠️ AUTO-REPLY não enviado (faltam envs ChatGuru):", missing);
+      const missingCG = requireChatGuruConfig();
+      if (missingCG.length) {
+        console.log("⚠️ AUTO-REPLY não enviado (faltam envs ChatGuru):", missingCG);
       } else {
-        console.log("🚀 AUTO-REPLY disparado (gatilho Teste) para:", String(celular));
-        const data = await chatGuruSendMessage({
-          chatNumber: String(celular),
-          text: AUTO_REPLY_TEXT,
-        });
+        // Se tiver OpenAI e IA ligada, responde com IA (base rtbrain)
+        const missingAI = requireOpenAIConfig();
+        const canUseAI = AI_ENABLED && missingAI.length === 0 && !!RTBRAIN_TEXT;
 
-        await dbSaveSend({ celular: String(celular), text: AUTO_REPLY_TEXT, source: "auto", result: data });
+        if (canUseAI) {
+          console.log("🤖 AUTO-REPLY (IA) disparado para:", String(celular));
+
+          const systemPrompt =
+            `${RTBRAIN_TEXT}\n\n` +
+            `REGRAS TÉCNICAS IMPORTANTES:\n` +
+            `- Nunca repita a mesma resposta duas vezes.\n` +
+            `- Seja direto, humano e curto.\n` +
+            `- Se faltar informação essencial, faça apenas 1 pergunta objetiva.\n` +
+            `- Se a resposta ficar grande, responda de forma que caiba em 1-2 mensagens.\n`;
+
+          const reply = await openaiCreateReply({
+            system: systemPrompt,
+            user: rawText,
+          });
+
+          const safeReply = (reply || "").trim() || AUTO_REPLY_FALLBACK_TEXT;
+
+          await chatGuruSendPossiblyChunked({
+            chatNumber: String(celular),
+            fullText: safeReply,
+            source: "ai",
+          });
+        } else {
+          console.log("🚀 AUTO-REPLY (fixo) disparado para:", String(celular));
+          const data = await chatGuruSendMessage({
+            chatNumber: String(celular),
+            text: AUTO_REPLY_FALLBACK_TEXT,
+          });
+          await dbSaveSend({ celular: String(celular), text: AUTO_REPLY_FALLBACK_TEXT, source: "auto", result: data });
+        }
       }
     }
   } catch (e) {
@@ -779,7 +819,6 @@ app.post("/admin/login", async (req, res) => {
 
   if (user !== ADMIN_USER) return res.status(200).send(loginPage("Usuário ou senha inválidos."));
 
-  // valida senha
   let ok = false;
 
   if (ADMIN_PASSWORD_HASH) {
@@ -787,7 +826,6 @@ app.post("/admin/login", async (req, res) => {
   } else if (ADMIN_PASSWORD) {
     ok = pass === ADMIN_PASSWORD;
   } else {
-    // se o cara não setar nada, não entra (por segurança)
     ok = false;
   }
 
@@ -820,6 +858,9 @@ app.get("/admin", async (req, res) => {
 
   const dbBadge = pool ? `<span class="badge ok">DB OK</span>` : `<span class="badge bad">DB OFF</span>`;
   const emailBadge = canEmail() ? `<span class="badge ok">EMAIL OK</span>` : `<span class="badge bad">EMAIL OFF</span>`;
+  const aiBadge =
+    AI_ENABLED && OPENAI_API_KEY ? `<span class="badge ok">IA ON</span>` : `<span class="badge bad">IA OFF</span>`;
+  const brainBadge = RTBRAIN_TEXT ? `<span class="badge ok">RTBRAIN OK</span>` : `<span class="badge bad">RTBRAIN OFF</span>`;
 
   const stats = await getStats("30d");
 
@@ -836,6 +877,8 @@ app.get("/admin", async (req, res) => {
               ${statusBadge}
               ${dbBadge}
               ${emailBadge}
+              ${aiBadge}
+              ${brainBadge}
             </div>
           </div>
         </div>
@@ -969,7 +1012,7 @@ app.get("/admin/alerts", async (req, res) => {
     <div class="grid">
       <div class="card">
         <div class="title" style="font-size:16px;">Alertas por e-mail</div>
-        <div class="hint">Quando o envio falhar (send-test/reply-last/auto), o sistema tenta alertar os e-mails cadastrados.</div>
+        <div class="hint">Quando o envio falhar (send-test/reply-last/auto/ai), o sistema tenta alertar os e-mails cadastrados.</div>
         <div style="margin-top:10px;">
           <span class="badge ${canEmail() ? "ok" : "bad"}">${canEmail() ? "SMTP configurado" : "SMTP não configurado"}</span>
         </div>
@@ -1106,7 +1149,6 @@ app.get("/admin/api/stats", async (req, res) => {
 // ====== OpenAI TEST (JSON) ======
 app.post("/admin/api/ai-test", async (req, res) => {
   try {
-    // Aceita acesso via token (curl) OU via sessão do painel (cookie)
     const token = req.headers["x-rt-admin-token"];
     const okByToken = RT_ADMIN_TOKEN && token === RT_ADMIN_TOKEN;
     const okBySession = isAdminAuthed(req);
@@ -1118,9 +1160,12 @@ app.post("/admin/api/ai-test", async (req, res) => {
     const { text, system } = req.body || {};
     if (!text) return res.status(400).json({ ok: false, error: "Body inválido. Envie { text }" });
 
+    const base = RTBRAIN_TEXT || "";
     const systemPrompt =
       (system && String(system).trim()) ||
-      "Você é um atendente humano, rápido, cordial e objetivo. Responda curto. Se faltar info, faça 1 pergunta objetiva.";
+      (base
+        ? `${base}\n\nREGRAS TÉCNICAS IMPORTANTES:\n- Nunca repita a mesma resposta duas vezes.\n- Seja direto, humano e curto.\n- Se faltar informação essencial, faça apenas 1 pergunta objetiva.\n`
+        : "Você é um atendente humano, rápido, cordial e objetivo. Responda curto. Se faltar info, faça 1 pergunta objetiva.");
 
     const reply = await openaiCreateReply({
       system: systemPrompt,
@@ -1138,7 +1183,6 @@ app.post("/admin/api/ai-test", async (req, res) => {
 
 // ====== Stats functions ======
 function periodToSql(period) {
-  // period: 1d,7d,30d,90d
   const map = { "1d": "1 day", "7d": "7 days", "30d": "30 days", "90d": "90 days" };
   return map[String(period)] || "7 days";
 }
@@ -1202,20 +1246,6 @@ async function getTrainingRows() {
   return r.rows;
 }
 
-function short(s) {
-  const t = (s || "").toString();
-  return t.length > 70 ? t.slice(0, 70) + "…" : t;
-}
-
-function escapeHtml(str) {
-  return String(str || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
 // ====== Start ======
 (async () => {
   await dbInit();
@@ -1223,5 +1253,6 @@ function escapeHtml(str) {
   app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log(`Admin: /admin/login`);
+    console.log(`AI_ENABLED=${AI_ENABLED} | MODEL=${OPENAI_MODEL} | RTBRAIN=${RTBRAIN_TEXT ? "loaded" : "missing"}`);
   });
 })();

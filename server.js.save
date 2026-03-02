@@ -1,72 +1,211 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const axios = require("axios");
 
 const app = express();
 
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
+// ====== Persistência local (debug) ======
 const EVENTS_FILE = path.join(__dirname, "events.jsonl");
 
-app.get("/health", (req, res) => {
+// ====== Token do webhook (pra bloquear chamadas aleatórias) ======
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || null; 
+// se não setar, ele deixa passar (recomendado setar no Render)
+
+// ====== Config ChatGuru API (env vars) ======
+const CHATGURU_API_ENDPOINT = process.env.CHATGURU_API_ENDPOINT || null; // ex: https://app.zap.guru/api/v1
+const CHATGURU_API_KEY = process.env.CHATGURU_API_KEY || null;
+const CHATGURU_ACCOUNT_ID = process.env.CHATGURU_ACCOUNT_ID || null;
+const CHATGURU_PHONE_ID = process.env.CHATGURU_PHONE_ID || null;
+
+// Token para rotas administrativas "API" (send-test, reply-last etc.)
+const RT_ADMIN_TOKEN = process.env.RT_ADMIN_TOKEN || null;
+
+// ====== Estado em memória (para TESTE / reply-last) ======
+let lastChat = null;
+
+// ====== Helpers ======
+function appendEvent(obj) {
+  try {
+    fs.appendFileSync(EVENTS_FILE, JSON.stringify(obj) + "\n", { encoding: "utf8" });
+  } catch (_) {}
+}
+
+function maskKey(key) {
+  if (!key || typeof key !== "string") return "(missing)";
+  const end = key.slice(-4);
+  return `****${end}`;
+}
+
+function requireChatGuruConfig() {
+  const missing = [];
+  if (!CHATGURU_API_ENDPOINT) missing.push("CHATGURU_API_ENDPOINT");
+  if (!CHATGURU_API_KEY) missing.push("CHATGURU_API_KEY");
+  if (!CHATGURU_ACCOUNT_ID) missing.push("CHATGURU_ACCOUNT_ID");
+  if (!CHATGURU_PHONE_ID) missing.push("CHATGURU_PHONE_ID");
+  return missing;
+}
+
+function requireAdminToken(req, res) {
+  const token = req.headers["x-rt-admin-token"];
+  if (!RT_ADMIN_TOKEN || token !== RT_ADMIN_TOKEN) {
+    res.status(401).json({ ok: false, error: "Unauthorized (x-rt-admin-token inválido)" });
+    return false;
+  }
+  return true;
+}
+
+function requireWebhookToken(req, res) {
+  // aceita por query ?token=... OU header x-chatguru-token
+  if (!WEBHOOK_TOKEN) return true; // se não configurou, não bloqueia
+
+  const q = req.query?.token ? String(req.query.token) : null;
+  const h = req.headers["x-chatguru-token"] ? String(req.headers["x-chatguru-token"]) : null;
+
+  const ok = (q && q === WEBHOOK_TOKEN) || (h && h === WEBHOOK_TOKEN);
+  if (!ok) {
+    res.status(401).json({ ok: false, error: "Unauthorized (token inválido)" });
+    return false;
+  }
+  return true;
+}
+
+async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
+  const params = new URLSearchParams({
+    key: CHATGURU_API_KEY,
+    account_id: CHATGURU_ACCOUNT_ID,
+    phone_id: CHATGURU_PHONE_ID,
+    action: "message_send",
+    text: String(text),
+    chat_number: String(chatNumber),
+  });
+
+  if (sendDate) params.set("send_date", String(sendDate));
+
+  const requestUrl = `${CHATGURU_API_ENDPOINT}?${params.toString()}`;
+
+  // Log seguro
+  const safeUrl = requestUrl.replace(/key=[^&]+/i, `key=${encodeURIComponent(maskKey(CHATGURU_API_KEY))}`);
+  console.log("=== ChatGuru request (safe) ===");
+  console.log(safeUrl);
+
+  const resp = await axios.post(requestUrl, null, { timeout: 20000 });
+  return resp.data;
+}
+
+// ====== Rotas ======
+app.get("/health", (_req, res) => {
   return res.status(200).json({ status: "online" });
 });
 
 app.post("/webhook/chatguru", (req, res) => {
+  if (!requireWebhookToken(req, res)) return;
+
+  const body = req.body || {};
+
   const event = {
     receivedAt: new Date().toISOString(),
+    ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
     headers: req.headers,
-    body: req.body,
+    body,
   };
 
-  console.log("Webhook recebido:");
+  console.log("=== Webhook recebido (ChatGuru) ===");
   console.log(JSON.stringify(event, null, 2));
 
-  fs.appendFileSync(EVENTS_FILE, JSON.stringify(event) + "\n");
+  // salva lastChat (pra reply-last)
+  const celular = body.celular || body.chat_number || body.telefone || null;
+  const chatId = body.chat_id || null;
+
+  if (celular) {
+    lastChat = {
+      updatedAt: new Date().toISOString(),
+      celular: String(celular),
+      chat_id: chatId ? String(chatId) : null,
+      nome: body.nome ? String(body.nome) : null,
+      phone_id: body.phone_id ? String(body.phone_id) : null,
+      origem: body.origem ? String(body.origem) : null,
+      texto_mensagem: body.texto_mensagem ? String(body.texto_mensagem) : null,
+      tipo_mensagem: body.tipo_mensagem ? String(body.tipo_mensagem) : null,
+    };
+  }
+
+  appendEvent(event);
 
   return res.status(200).json({ ok: true });
 });
 
+// ====== send-test (manual) ======
+app.post("/send-test", async (req, res) => {
+  try {
+    if (!requireAdminToken(req, res)) return;
+
+    const missing = requireChatGuruConfig();
+    if (missing.length) {
+      return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta no servidor", missing });
+    }
+
+    const { chat_number, text, send_date } = req.body || {};
+    if (!chat_number || !text) {
+      return res.status(400).json({ ok: false, error: "Body inválido. Envie { chat_number, text }" });
+    }
+
+    const data = await chatGuruSendMessage({
+      chatNumber: String(chat_number),
+      text: String(text),
+      sendDate: send_date ? String(send_date) : undefined,
+    });
+
+    return res.status(200).json({ ok: true, result: data });
+  } catch (err) {
+    const payload = err?.response?.data || null;
+    const status = err?.response?.status || null;
+    const msg = payload || err?.message || String(err);
+    return res.status(500).json({ ok: false, error: msg, status });
+  }
+});
+
+// ====== reply-last (manual) ======
+app.post("/reply-last", async (req, res) => {
+  try {
+    if (!requireAdminToken(req, res)) return;
+
+    const missing = requireChatGuruConfig();
+    if (missing.length) {
+      return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta no servidor", missing });
+    }
+
+    if (!lastChat || !lastChat.celular) {
+      return res.status(400).json({ ok: false, error: "Ainda não existe lastChat. Envie algo no webhook primeiro." });
+    }
+
+    const { text, send_date } = req.body || {};
+    if (!text) {
+      return res.status(400).json({ ok: false, error: "Body inválido. Envie { text }" });
+    }
+
+    const target = lastChat.celular;
+
+    const data = await chatGuruSendMessage({
+      chatNumber: target,
+      text: String(text),
+      sendDate: send_date ? String(send_date) : undefined,
+    });
+
+    return res.status(200).json({ ok: true, target, lastChat, result: data });
+  } catch (err) {
+    const payload = err?.response?.data || null;
+    const status = err?.response?.status || null;
+    const msg = payload || err?.message || String(err);
+    return res.status(500).json({ ok: false, error: msg, status });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
-});
-const 
-express = 
-require("express");
-const fs = require("fs");
-const path = require("path");
-
-const app = express();
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-const PORT = 3000;
-
-const EVENTS_FILE = path.join(__dirname, "events.jsonl");
-
-app.get("/health", (req, res) => {
-  return res.status(200).json({ status: "online" });
-});
-
-app.post("/webhook/chatguru", (req, res) => {
-  const event = {
-    receivedAt: new Date().toISOString(),
-    headers: req.headers,
-    body: req.body,
-  };
-
-  console.log("Webhook recebido:");
-  console.log(JSON.stringify(event, null, 2));
-
-  fs.appendFileSync(EVENTS_FILE, JSON.stringify(event) + "\n");
-
-  return res.status(200).json({ ok: true });
-});
-
-app.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
+  console.log(`Servidor rodando na porta ${PORT}`);
 });

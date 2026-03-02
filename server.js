@@ -680,56 +680,79 @@ app.post("/webhook/chatguru", async (req, res) => {
   appendEvent(event);
   await dbSaveEvent(body);
 
-  // ====== AUTO-REPLY NO GATILHO "Teste" ======
-  try {
-    const rawText = (body.texto_mensagem || "").toString();
-    const normalized = rawText.trim().toLowerCase();
+// ====== AUTO-REPLY / AI REPLY ======
+try {
+  const rawText = (body.texto_mensagem || "").toString();
+  const normalized = rawText.trim().toLowerCase();
+  const tipo = (body.tipo_mensagem || "").toString().toLowerCase();
 
-    if (celular && normalized === AUTO_TRIGGER_TEXT) {
-      const missingCG = requireChatGuruConfig();
-      if (missingCG.length) {
-        console.log("⚠️ AUTO-REPLY não enviado (faltam envs ChatGuru):", missingCG);
-      } else {
-        // Se tiver OpenAI e IA ligada, responde com IA (base rtbrain)
-        const missingAI = requireOpenAIConfig();
-        const canUseAI = AI_ENABLED && missingAI.length === 0 && !!RTBRAIN_TEXT;
-
-        if (canUseAI) {
-          console.log("🤖 AUTO-REPLY (IA) disparado para:", String(celular));
-
-          const systemPrompt =
-            `${RTBRAIN_TEXT}\n\n` +
-            `REGRAS TÉCNICAS IMPORTANTES:\n` +
-            `- Nunca repita a mesma resposta duas vezes.\n` +
-            `- Seja direto, humano e curto.\n` +
-            `- Se faltar informação essencial, faça apenas 1 pergunta objetiva.\n` +
-            `- Se a resposta ficar grande, responda de forma que caiba em 1-2 mensagens.\n`;
-
-          const reply = await openaiCreateReply({
-            system: systemPrompt,
-            user: rawText,
-          });
-
-          const safeReply = (reply || "").trim() || AUTO_REPLY_FALLBACK_TEXT;
-
-          await chatGuruSendPossiblyChunked({
-            chatNumber: String(celular),
-            fullText: safeReply,
-            source: "ai",
-          });
-        } else {
-          console.log("🚀 AUTO-REPLY (fixo) disparado para:", String(celular));
-          const data = await chatGuruSendMessage({
-            chatNumber: String(celular),
-            text: AUTO_REPLY_FALLBACK_TEXT,
-          });
-          await dbSaveSend({ celular: String(celular), text: AUTO_REPLY_FALLBACK_TEXT, source: "auto", result: data });
-        }
-      }
-    }
-  } catch (e) {
-    console.log("⚠️ AUTO-REPLY erro:", e?.message || e);
+  // Só responde chat "humano"
+  if (!celular || !rawText.trim() || tipo !== "chat") {
+    // ignora eventos vazios/sistema
+    return res.status(200).json({ ok: true });
   }
+
+  // --- trava anti-duplicação (memória) ---
+  // assinatura baseada em chat_id + texto + datetime_post (ou receivedAt)
+  const sig = `${body.chat_id || ""}::${rawText.trim()}::${body.datetime_post || event.receivedAt || ""}`;
+
+  // guarda no lastChat também (rápido e simples)
+  if (lastChat && lastChat._lastSig === sig) {
+    console.log("🔁 Evento duplicado - ignorado:", sig);
+    return res.status(200).json({ ok: true, duplicate: true });
+  }
+  if (lastChat) lastChat._lastSig = sig;
+
+  // --- modo “teste” opcional ---
+  const forceTest = normalized === AUTO_TRIGGER_TEXT; // "teste"
+
+  // Se você quiser que responda SEMPRE, deixe a condição true.
+  // Se você quiser responder só no "teste", deixe forceTest.
+  const SHOULD_REPLY = true; // <<< aqui liga o robô de verdade
+
+  if (!SHOULD_REPLY && !forceTest) {
+    console.log("🛑 SHOULD_REPLY=false e não foi gatilho 'teste'. Ignorando.");
+    return res.status(200).json({ ok: true });
+  }
+
+  // --- IA responde ---
+  const missingCG = requireChatGuruConfig();
+  if (missingCG.length) {
+    console.log("⚠️ Não respondeu (faltam envs ChatGuru):", missingCG);
+    return res.status(200).json({ ok: true, warn: "missing_chatguru_env" });
+  }
+
+  const missingAI = requireOpenAIConfig();
+  const canUseAI = AI_ENABLED && missingAI.length === 0;
+
+  if (!canUseAI) {
+    console.log("⚠️ IA desligada ou sem chave. Enviando fallback.");
+    const data = await chatGuruSendMessage({ chatNumber: String(celular), text: AUTO_REPLY_TEXT });
+    await dbSaveSend({ celular: String(celular), text: AUTO_REPLY_TEXT, source: "auto", result: data });
+    return res.status(200).json({ ok: true });
+  }
+
+  const systemPrompt =
+    "Você é um atendente humano, rápido, cordial e objetivo. " +
+    "Responda curto. Se faltar info, faça 1 pergunta objetiva. " +
+    "Nunca repita a resposta duas vezes.";
+
+  const reply = await openaiCreateReply({
+    system: systemPrompt,
+    user: rawText,
+  });
+
+  const finalText = (reply || "").trim() || AUTO_REPLY_TEXT;
+
+  const data = await chatGuruSendMessage({
+    chatNumber: String(celular),
+    text: finalText,
+  });
+
+  await dbSaveSend({ celular: String(celular), text: finalText, source: "ai", result: data });
+} catch (e) {
+  console.log("⚠️ AI/AUTO-REPLY erro:", e?.message || e);
+}
 
   return res.status(200).json({ ok: true });
 });

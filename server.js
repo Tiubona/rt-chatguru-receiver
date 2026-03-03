@@ -21,25 +21,22 @@ const PORT = process.env.PORT || 3000;
 const EVENTS_FILE = path.join(__dirname, "events.jsonl");
 
 // ====== Config ChatGuru API (Render env vars) ======
-const CHATGURU_API_ENDPOINT = process.env.CHATGURU_API_ENDPOINT; // ex: https://app.zap.guru/api/v1
+const CHATGURU_API_ENDPOINT = process.env.CHATGURU_API_ENDPOINT;
 const CHATGURU_API_KEY = process.env.CHATGURU_API_KEY;
 const CHATGURU_ACCOUNT_ID = process.env.CHATGURU_ACCOUNT_ID;
 const CHATGURU_PHONE_ID = process.env.CHATGURU_PHONE_ID;
 
-// Token para rotas administrativas "API" (send-test, reply-last etc.)
+// Token para rotas administrativas
 const RT_ADMIN_TOKEN = process.env.RT_ADMIN_TOKEN;
 
 // ====== Admin Panel Login ======
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
-// você pode setar ADMIN_PASSWORD direto (simples)
-// ou setar ADMIN_PASSWORD_HASH (mais seguro)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || null;
 
-// ⚠️ Reaproveitando sua env atual: se você já usa SESSION_SECRET, ele vira o segredo do JWT
 const ADMIN_JWT_SECRET = process.env.SESSION_SECRET || "change_me_super_secret";
 const ADMIN_JWT_COOKIE = "rt_admin_jwt";
-const ADMIN_JWT_MAX_AGE_MS = 1000 * 60 * 60 * 12; // 12h
+const ADMIN_JWT_MAX_AGE_MS = 1000 * 60 * 60 * 12;
 
 // ====== Email (alerts) ======
 const SMTP_HOST = process.env.SMTP_HOST || null;
@@ -57,27 +54,23 @@ const pool = DATABASE_URL
     })
   : null;
 
-// ====== Estado em memória (para TESTE) ======
+// ====== Estado em memória (debug) ======
 let lastChat = null;
 
-// ====== AUTO-REPLY (Gatilho) ======
-const AUTO_TRIGGER_TEXT = "teste"; // "Teste" (case-insensitive)
-
-// Mensagem fixa fallback (quando IA desligada / RTBRAIN ausente)
+// ====== AUTO-REPLY ======
+const AUTO_TRIGGER_TEXT = "teste";
 const AUTO_REPLY_FALLBACK_TEXT = "Recebi sua mensagem ✅ Só um segundo que já te respondo aqui.";
-
-// Tamanho máximo por mensagem (pra evitar textão quebrar no WhatsApp)
 const MAX_WPP_CHARS = process.env.MAX_WPP_CHARS ? Number(process.env.MAX_WPP_CHARS) : 650;
 
-// ====== URA gate (só responde quando bater) ======
+// ====== Buffer para juntar mensagens ======
+const BUFFER_SECONDS = process.env.BUFFER_SECONDS ? Number(process.env.BUFFER_SECONDS) : 20;
+const pendingBuffers = new Map(); // celular -> { timer, items: [{text, at}] }
+
+// ====== URA gate ======
 const ALLOWED_URAS = String(process.env.ALLOWED_URAS || "Testechat")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
-// ====== ✅ NOVO: Buffer de contexto (20s) ======
-const WAIT_BEFORE_REPLY_MS = 20000; // pedido: 20 segundos fixos
-const pendingByCelular = new Map(); // celular -> { timer, texts[], lastBody, lastEvent, lastSigBase }
 
 // ====== Helpers ======
 function appendEvent(obj) {
@@ -110,7 +103,7 @@ function requireAdminToken(req, res) {
   return true;
 }
 
-// ====== Cookies (sem dependência) ======
+// ====== Cookies ======
 function parseCookies(req) {
   const header = req.headers.cookie || "";
   const out = {};
@@ -196,7 +189,7 @@ async function chatGuruSendMessage({ chatNumber, text, sendDate }) {
   return resp.data;
 }
 
-// ====== 2-part send (para evitar corte) ======
+// ====== 2-part send ======
 function splitIntoTwoMessages(text, maxChars) {
   const t = String(text || "").trim();
   if (!t) return [""];
@@ -274,7 +267,7 @@ async function dbInit() {
         sent_at TIMESTAMPTZ NOT NULL,
         celular TEXT NOT NULL,
         text TEXT NOT NULL,
-        source TEXT NOT NULL, -- send-test | reply-last | auto | ai
+        source TEXT NOT NULL,
         result JSONB
       );
     `);
@@ -366,7 +359,55 @@ async function cfgSet(key, valueJson) {
   );
 }
 
-// ✅ buscar histórico recente do chat para dar contexto pra IA
+// ====== Estado por contato (PERSISTENTE) ======
+function saoPauloDayKey(date = new Date()) {
+  // retorna YYYY-MM-DD no fuso America/Sao_Paulo
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return fmt.format(date); // en-CA => 2026-03-03
+}
+
+function stateKeyFor(celular) {
+  return `state:${String(celular)}`;
+}
+
+async function getState(celular) {
+  const fallback = { greeted_on: null, greeted_today: false, name: null, service: null, stage: null, last_reply_hash: null };
+  const s = await cfgGet(stateKeyFor(celular), fallback);
+  if (!s || typeof s !== "object") return fallback;
+
+  const today = saoPauloDayKey(new Date());
+  const greeted_today = s.greeted_on === today;
+
+  return { ...fallback, ...s, greeted_today };
+}
+
+async function setState(celular, patch) {
+  const cur = await getState(celular);
+  const next = { ...cur, ...patch };
+
+  // recalcula greeted_today baseado em greeted_on
+  const today = saoPauloDayKey(new Date());
+  next.greeted_today = next.greeted_on === today;
+
+  await cfgSet(stateKeyFor(celular), next);
+  return next;
+}
+
+function detectServiceFromText(text) {
+  const t = String(text || "").toLowerCase();
+  if (t.includes("tatu")) return "tatuagem";
+  if (t.includes("sobr") || t.includes("micro")) return "sobrancelha";
+  if (t.includes("estria")) return "estrias";
+  if (t.includes("hof") || t.includes("harmon") || t.includes("botox") || t.includes("preench")) return "harmonizacao";
+  return null;
+}
+
+// ====== Histórico curto ======
 async function getRecentChatHistory(celular, limit = 10) {
   if (!pool) return [];
   try {
@@ -385,7 +426,7 @@ async function getRecentChatHistory(celular, limit = 10) {
     );
 
     const rows = r.rows || [];
-    return rows.reverse(); // deixa em ordem "antigo -> novo"
+    return rows.reverse();
   } catch (e) {
     console.log("DB: erro buscando histórico:", e?.message || e);
     return [];
@@ -427,7 +468,279 @@ async function sendAlertEmail(subject, text) {
   }
 }
 
-// ====== Pages (HTML) ======
+// ====== UI helpers (mantidos) ======
+function short(s) {
+  const t = (s || "").toString();
+  return t.length > 70 ? t.slice(0, 70) + "…" : t;
+}
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function isAllowedUra(body) {
+  const ura = body?.bot_context?.URA || body?.bot_context?.ura || body?.URA || null;
+  if (!ura) return false;
+  return ALLOWED_URAS.includes(String(ura).trim());
+}
+
+// ====== Rotas base ======
+app.get("/", (_req, res) => res.status(200).json({ ok: true, service: "rt-chatguru-receiver" }));
+app.get("/health", (_req, res) => res.status(200).json({ status: "online" }));
+
+// ====== Buffer: agrega mensagens por 20s ======
+function addToBuffer(celular, text) {
+  const key = String(celular);
+  const cur = pendingBuffers.get(key) || { items: [], timer: null };
+
+  cur.items.push({ text: String(text || ""), at: new Date().toISOString() });
+
+  if (cur.timer) clearTimeout(cur.timer);
+
+  cur.timer = setTimeout(async () => {
+    const pack = pendingBuffers.get(key);
+    if (!pack) return;
+
+    pendingBuffers.delete(key);
+
+    const msgs = pack.items
+      .map((i) => String(i.text || "").trim())
+      .filter(Boolean);
+
+    const aggregated = msgs.join("\n");
+
+    console.log(`⏳ Buffer ${BUFFER_SECONDS}s finalizado | celular=${key} | msgs=${msgs.length}`);
+    console.log(`📦 Texto agregado: ${aggregated}`);
+
+    // dispara processamento final
+    await processAggregatedMessage(key, aggregated);
+  }, BUFFER_SECONDS * 1000);
+
+  pendingBuffers.set(key, cur);
+}
+
+// ====== Processador final (com estado + IA) ======
+async function processAggregatedMessage(celular, aggregatedText) {
+  try {
+    const missingCG = requireChatGuruConfig();
+    if (missingCG.length) {
+      console.log("⚠️ Não respondeu (faltam envs ChatGuru):", missingCG);
+      return;
+    }
+
+    const canUseAI = ai.canUseAI();
+    if (!canUseAI) {
+      await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: AUTO_REPLY_FALLBACK_TEXT, source: "auto" });
+      return;
+    }
+
+    // Estado atual
+    let state = await getState(celular);
+
+    // Se nome veio do ChatGuru em algum evento recente, ele já estará no banco.
+    // Mas aqui como estamos fora do handler, atualiza pelo lastChat (debug) se disponível:
+    if (!state.name && lastChat?.celular === String(celular) && lastChat?.nome) {
+      state = await setState(celular, { name: String(lastChat.nome) });
+    }
+
+    // Detecta serviço pela fala do cliente
+    const detectedService = detectServiceFromText(aggregatedText);
+    if (detectedService && state.service !== detectedService) {
+      state = await setState(celular, { service: detectedService });
+    }
+
+    // Saudação 1x/dia: marcamos aqui COMO FEITA antes da IA responder (pra IA obedecer o estado)
+    // ATENÇÃO: a IA só deve saudar se greeted_today=false
+    if (!state.greeted_today) {
+      state = await setState(celular, { greeted_on: saoPauloDayKey(new Date()) });
+    }
+
+    // Histórico curto para contexto
+    const history = await getRecentChatHistory(String(celular), 10);
+
+    // Fora do escopo: fallback controlado
+    if (ai.looksLikeOutOfScope(aggregatedText)) {
+      const out = `Entendi. Essa dúvida foge do que eu tenho aqui agora — vou confirmar com a Larissa e já te retorno. 😉\n\nPra eu te ajudar no que é da RT: é sobre tatuagem, sobrancelha, estrias ou harmonização?`;
+      await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: out, source: "scope" });
+      return;
+    }
+
+    const reply = await ai.generateLockedReply(aggregatedText, history, state);
+    const finalText = String(reply || "").trim() || AUTO_REPLY_FALLBACK_TEXT;
+
+    await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: finalText, source: "ai" });
+  } catch (e) {
+    console.log("⚠️ processAggregatedMessage erro:", e?.message || e);
+  }
+}
+
+// ================== WEBHOOK ==================
+app.post("/webhook/chatguru", async (req, res) => {
+  const body = req.body || {};
+
+  const event = {
+    receivedAt: new Date().toISOString(),
+    ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
+    headers: req.headers,
+    body,
+  };
+
+  console.log("=== Webhook recebido (ChatGuru) ===");
+  console.log(JSON.stringify(event, null, 2));
+
+  const celular = body.celular || body.chat_number || body.telefone || null;
+  const chatId = body.chat_id || null;
+
+  if (celular) {
+    lastChat = {
+      updatedAt: new Date().toISOString(),
+      celular: String(celular),
+      chat_id: chatId ? String(chatId) : null,
+      nome: body.nome ? String(body.nome) : null,
+      phone_id: body.phone_id ? String(body.phone_id) : null,
+      origem: body.origem ? String(body.origem) : null,
+      texto_mensagem: body.texto_mensagem ? String(body.texto_mensagem) : null,
+      tipo_mensagem: body.tipo_mensagem ? String(body.tipo_mensagem) : null,
+      _lastSig: lastChat?._lastSig || null,
+    };
+
+    console.log("=== lastChat atualizado ===");
+    console.log(JSON.stringify(lastChat, null, 2));
+  } else {
+    console.log("⚠️ Webhook recebido, mas não achei 'celular' no body.");
+  }
+
+  appendEvent(event);
+  await dbSaveEvent(body);
+
+  // ====== AUTO-REPLY / AI REPLY ======
+  try {
+    const rawText = (body.texto_mensagem || "").toString();
+    const normalized = rawText.trim().toLowerCase();
+    const tipo = (body.tipo_mensagem || "").toString().toLowerCase();
+
+    if (!celular || !rawText.trim() || tipo !== "chat") {
+      return res.status(200).json({ ok: true, ignored: "non-chat-or-empty" });
+    }
+
+    if (!isAllowedUra(body)) {
+      console.log("🧱 URA não permitida — ignorando. URA =", body?.bot_context?.URA);
+      return res.status(200).json({ ok: true, ignored: "ura_not_allowed" });
+    }
+
+    // --- trava anti-duplicação do evento (igual a tua) ---
+    const sig = `${body.chat_id || ""}::${rawText.trim()}::${body.datetime_post || event.receivedAt || ""}`;
+    if (lastChat && lastChat._lastSig === sig) {
+      console.log("🔁 Evento duplicado - ignorado:", sig);
+      return res.status(200).json({ ok: true, duplicate: true });
+    }
+    if (lastChat) lastChat._lastSig = sig;
+
+    const forceTest = normalized === AUTO_TRIGGER_TEXT;
+    const SHOULD_REPLY = true;
+
+    if (!SHOULD_REPLY && !forceTest) {
+      console.log("🛑 SHOULD_REPLY=false e não foi gatilho 'teste'. Ignorando.");
+      return res.status(200).json({ ok: true, ignored: "should_reply_false" });
+    }
+
+    // ✅ Atualiza estado com nome do ChatGuru (se vier)
+    if (body.nome && celular) {
+      const s = await getState(String(celular));
+      if (!s.name) {
+        await setState(String(celular), { name: String(body.nome) });
+      }
+    }
+
+    // ✅ Buffer 20s: junta mensagens e responde com contexto
+    addToBuffer(String(celular), rawText);
+  } catch (e) {
+    console.log("⚠️ AI/AUTO-REPLY erro:", e?.message || e);
+  }
+
+  return res.status(200).json({ ok: true });
+});
+
+// ====== send-test (manual) ======
+app.post("/send-test", async (req, res) => {
+  try {
+    if (!requireAdminToken(req, res)) return;
+
+    const missing = requireChatGuruConfig();
+    if (missing.length) return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta no servidor", missing });
+
+    const { chat_number, text, send_date } = req.body || {};
+    if (!chat_number || !text) return res.status(400).json({ ok: false, error: "Body inválido. Envie { chat_number, text }" });
+
+    const data = await chatGuruSendMessage({
+      chatNumber: String(chat_number),
+      text: String(text),
+      sendDate: send_date ? String(send_date) : undefined,
+    });
+
+    await dbSaveSend({ celular: chat_number, text, source: "send-test", result: data });
+
+    return res.status(200).json({ ok: true, result: data });
+  } catch (err) {
+    const payload = err?.response?.data || null;
+    const status = err?.response?.status || null;
+    const msg = payload || err?.message || String(err);
+
+    await sendAlertEmail("RT ALERTA: Falha no send-test", `Status: ${status}\nErro: ${JSON.stringify(msg)}`);
+
+    return res.status(500).json({ ok: false, error: msg, status });
+  }
+});
+
+// ====== reply-last (manual) ======
+app.post("/reply-last", async (req, res) => {
+  try {
+    if (!requireAdminToken(req, res)) return;
+
+    const missing = requireChatGuruConfig();
+    if (missing.length) return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta no servidor", missing });
+
+    if (!lastChat || !lastChat.celular) {
+      return res.status(400).json({ ok: false, error: "Ainda não existe lastChat em memória. Envie mensagem no webhook primeiro." });
+    }
+
+    const { text, send_date } = req.body || {};
+    if (!text) return res.status(400).json({ ok: false, error: "Body inválido. Envie { text }" });
+
+    const target = lastChat.celular;
+
+    const data = await chatGuruSendMessage({
+      chatNumber: target,
+      text: String(text),
+      sendDate: send_date ? String(send_date) : undefined,
+    });
+
+    await dbSaveSend({ celular: target, text, source: "reply-last", result: data });
+
+    return res.status(200).json({ ok: true, target, lastChat, result: data });
+  } catch (err) {
+    const payload = err?.response?.data || null;
+    const status = err?.response?.status || null;
+    const msg = payload || err?.message || String(err);
+
+    await sendAlertEmail("RT ALERTA: Falha no reply-last", `Status: ${status}\nErro: ${JSON.stringify(msg)}`);
+
+    return res.status(500).json({ ok: false, error: msg, status });
+  }
+});
+
+app.get("/last-chat", (req, res) => {
+  const token = req.headers["x-rt-admin-token"];
+  if (!RT_ADMIN_TOKEN || token !== RT_ADMIN_TOKEN) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  return res.status(200).json({ ok: true, lastChat });
+});
+
+// ================== ADMIN PANEL (mantido do teu arquivo) ==================
 function htmlLayout(title, body) {
   return `<!doctype html>
 <html lang="pt-br">
@@ -579,294 +892,6 @@ function adminFooter() {
   return `</div>`;
 }
 
-function short(s) {
-  const t = (s || "").toString();
-  return t.length > 70 ? t.slice(0, 70) + "…" : t;
-}
-
-function escapeHtml(str) {
-  return String(str || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function isAllowedUra(body) {
-  const ura = body?.bot_context?.URA || body?.bot_context?.ura || body?.URA || null;
-  if (!ura) return false;
-  return ALLOWED_URAS.includes(String(ura).trim());
-}
-
-// ====== ✅ NOVO: processamento do pacote (reaproveita sua lógica) ======
-async function processBufferedMessage({ celular, body, event, aggregatedText }) {
-  try {
-    const rawText = String(aggregatedText || "").toString();
-    const normalized = rawText.trim().toLowerCase();
-    const tipo = (body.tipo_mensagem || "").toString().toLowerCase();
-
-    // Só responde chat "humano"
-    if (!celular || !rawText.trim() || tipo !== "chat") {
-      return;
-    }
-
-    // Só responde quando URA for permitida (ex.: Testechat)
-    if (!isAllowedUra(body)) {
-      console.log("🧱 URA não permitida — ignorando. URA =", body?.bot_context?.URA);
-      return;
-    }
-
-    // --- trava anti-duplicação (agora usando o pacote agregado) ---
-    const lastStamp = body.datetime_post || event.receivedAt || "";
-    const sig = `${body.chat_id || ""}::${rawText.trim()}::${lastStamp}`;
-    if (lastChat && lastChat._lastSig === sig) {
-      console.log("🔁 Evento duplicado - ignorado:", sig);
-      return;
-    }
-    if (lastChat) lastChat._lastSig = sig;
-
-    // --- modo “teste” opcional (mantém o gatilho) ---
-    const forceTest = normalized === AUTO_TRIGGER_TEXT;
-
-    // Robô ligado de verdade: responde sempre (desde que URA permitida)
-    const SHOULD_REPLY = true;
-
-    if (!SHOULD_REPLY && !forceTest) {
-      console.log("🛑 SHOULD_REPLY=false e não foi gatilho 'teste'. Ignorando.");
-      return;
-    }
-
-    const missingCG = requireChatGuruConfig();
-    if (missingCG.length) {
-      console.log("⚠️ Não respondeu (faltam envs ChatGuru):", missingCG);
-      return;
-    }
-
-    const canUseAI = ai.canUseAI();
-
-    // Se IA não puder, envia fallback
-    if (!canUseAI) {
-      console.log("⚠️ IA desligada ou sem chave. Enviando fallback.");
-      await chatGuruSendPossiblyChunked({
-        chatNumber: String(celular),
-        fullText: AUTO_REPLY_FALLBACK_TEXT,
-        source: "auto",
-      });
-      return;
-    }
-
-    // Cinto adicional: se claramente fora do escopo, já manda fallback
-    if (ai.looksLikeOutOfScope(rawText)) {
-      const out = `Entendi. Essa dúvida foge do que eu tenho aqui agora — vou confirmar com a Larissa e já te retorno. 😉\n\nPra eu te ajudar no que é da RT: é sobre tatuagem, sobrancelha, estrias ou harmonização?`;
-      await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: out, source: "scope" });
-      return;
-    }
-
-    // histórico curto para dar contexto
-    const history = await getRecentChatHistory(String(celular), 10);
-
-    // ⚠️ aqui você já estava chamando com history
-    const reply = await ai.generateLockedReply(rawText, history);
-
-    const finalText = String(reply || "").trim() || AUTO_REPLY_FALLBACK_TEXT;
-
-    await chatGuruSendPossiblyChunked({
-      chatNumber: String(celular),
-      fullText: finalText,
-      source: "ai",
-    });
-  } catch (e) {
-    console.log("⚠️ AI/AUTO-REPLY erro:", e?.message || e);
-  }
-}
-
-// ====== Rotas base ======
-app.get("/", (_req, res) => res.status(200).json({ ok: true, service: "rt-chatguru-receiver" }));
-app.get("/health", (_req, res) => res.status(200).json({ status: "online" }));
-
-// ====== Webhook receiver ======
-app.post("/webhook/chatguru", async (req, res) => {
-  const body = req.body || {};
-
-  const event = {
-    receivedAt: new Date().toISOString(),
-    ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress,
-    headers: req.headers,
-    body,
-  };
-
-  console.log("=== Webhook recebido (ChatGuru) ===");
-  console.log(JSON.stringify(event, null, 2));
-
-  // lastChat em memória (teste)
-  const celular = body.celular || body.chat_number || body.telefone || null;
-  const chatId = body.chat_id || null;
-
-  if (celular) {
-    lastChat = {
-      updatedAt: new Date().toISOString(),
-      celular: String(celular),
-      chat_id: chatId ? String(chatId) : null,
-      nome: body.nome ? String(body.nome) : null,
-      phone_id: body.phone_id ? String(body.phone_id) : null,
-      origem: body.origem ? String(body.origem) : null,
-      texto_mensagem: body.texto_mensagem ? String(body.texto_mensagem) : null,
-      tipo_mensagem: body.tipo_mensagem ? String(body.tipo_mensagem) : null,
-      _lastSig: lastChat?._lastSig || null,
-    };
-
-    console.log("=== lastChat atualizado ===");
-    console.log(JSON.stringify(lastChat, null, 2));
-  } else {
-    console.log("⚠️ Webhook recebido, mas não achei 'celular' no body.");
-  }
-
-  appendEvent(event);
-  await dbSaveEvent(body);
-
-  // ✅ NOVO: responde 200 rápido e processa via buffer (20s)
-  try {
-    const rawText = (body.texto_mensagem || "").toString();
-    const tipo = (body.tipo_mensagem || "").toString().toLowerCase();
-
-    // Só acumula "chat" humano com texto
-    if (!celular || !rawText.trim() || tipo !== "chat") {
-      return res.status(200).json({ ok: true, ignored: "non-chat-or-empty" });
-    }
-
-    // Se URA não é permitida, nem coloca no buffer (mesma regra de antes)
-    if (!isAllowedUra(body)) {
-      console.log("🧱 URA não permitida — ignorando. URA =", body?.bot_context?.URA);
-      return res.status(200).json({ ok: true, ignored: "ura_not_allowed" });
-    }
-
-    const key = String(celular);
-
-    // cria/atualiza buffer
-    const existing = pendingByCelular.get(key) || null;
-
-    const next = existing || {
-      timer: null,
-      texts: [],
-      lastBody: null,
-      lastEvent: null,
-    };
-
-    next.texts.push(rawText.trim());
-    next.lastBody = body;   // guarda o "último" body pra URA/chat_id/datetime_post etc.
-    next.lastEvent = event; // idem
-
-    // reseta timer 20s
-    if (next.timer) clearTimeout(next.timer);
-
-    next.timer = setTimeout(async () => {
-      try {
-        const payload = pendingByCelular.get(key);
-        if (!payload) return;
-
-        pendingByCelular.delete(key);
-
-        const aggregatedText = (payload.texts || []).filter(Boolean).join("\n").trim();
-        console.log(`⏳ Buffer 20s finalizado | celular=${key} | msgs=${payload.texts.length}`);
-        console.log("📦 Texto agregado:", aggregatedText);
-
-        await processBufferedMessage({
-          celular: key,
-          body: payload.lastBody || {},
-          event: payload.lastEvent || { receivedAt: new Date().toISOString() },
-          aggregatedText,
-        });
-      } catch (e) {
-        console.log("⚠️ Buffer flush erro:", e?.message || e);
-      }
-    }, WAIT_BEFORE_REPLY_MS);
-
-    pendingByCelular.set(key, next);
-
-    return res.status(200).json({ ok: true, buffered: true, wait_ms: WAIT_BEFORE_REPLY_MS });
-  } catch (e) {
-    console.log("⚠️ Buffer setup erro:", e?.message || e);
-    return res.status(200).json({ ok: true });
-  }
-});
-
-// ====== send-test (manual) ======
-app.post("/send-test", async (req, res) => {
-  try {
-    if (!requireAdminToken(req, res)) return;
-
-    const missing = requireChatGuruConfig();
-    if (missing.length) return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta no servidor", missing });
-
-    const { chat_number, text, send_date } = req.body || {};
-    if (!chat_number || !text) return res.status(400).json({ ok: false, error: "Body inválido. Envie { chat_number, text }" });
-
-    const data = await chatGuruSendMessage({
-      chatNumber: String(chat_number),
-      text: String(text),
-      sendDate: send_date ? String(send_date) : undefined,
-    });
-
-    await dbSaveSend({ celular: chat_number, text, source: "send-test", result: data });
-
-    return res.status(200).json({ ok: true, result: data });
-  } catch (err) {
-    const payload = err?.response?.data || null;
-    const status = err?.response?.status || null;
-    const msg = payload || err?.message || String(err);
-
-    await sendAlertEmail("RT ALERTA: Falha no send-test", `Status: ${status}\nErro: ${JSON.stringify(msg)}`);
-
-    return res.status(500).json({ ok: false, error: msg, status });
-  }
-});
-
-// ====== reply-last (manual) ======
-app.post("/reply-last", async (req, res) => {
-  try {
-    if (!requireAdminToken(req, res)) return;
-
-    const missing = requireChatGuruConfig();
-    if (missing.length) return res.status(500).json({ ok: false, error: "Config ChatGuru incompleta no servidor", missing });
-
-    if (!lastChat || !lastChat.celular) {
-      return res.status(400).json({ ok: false, error: "Ainda não existe lastChat em memória. Envie mensagem no webhook primeiro." });
-    }
-
-    const { text, send_date } = req.body || {};
-    if (!text) return res.status(400).json({ ok: false, error: "Body inválido. Envie { text }" });
-
-    const target = lastChat.celular;
-
-    const data = await chatGuruSendMessage({
-      chatNumber: target,
-      text: String(text),
-      sendDate: send_date ? String(send_date) : undefined,
-    });
-
-    await dbSaveSend({ celular: target, text, source: "reply-last", result: data });
-
-    return res.status(200).json({ ok: true, target, lastChat, result: data });
-  } catch (err) {
-    const payload = err?.response?.data || null;
-    const status = err?.response?.status || null;
-    const msg = payload || err?.message || String(err);
-
-    await sendAlertEmail("RT ALERTA: Falha no reply-last", `Status: ${status}\nErro: ${JSON.stringify(msg)}`);
-
-    return res.status(500).json({ ok: false, error: msg, status });
-  }
-});
-
-app.get("/last-chat", (req, res) => {
-  const token = req.headers["x-rt-admin-token"];
-  if (!RT_ADMIN_TOKEN || token !== RT_ADMIN_TOKEN) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  return res.status(200).json({ ok: true, lastChat });
-});
-
-// ================== ADMIN PANEL ==================
-
 // Login pages
 app.get("/admin/login", (_req, res) => res.status(200).send(loginPage(null)));
 
@@ -877,14 +902,8 @@ app.post("/admin/login", async (req, res) => {
   if (user !== ADMIN_USER) return res.status(200).send(loginPage("Usuário ou senha inválidos."));
 
   let ok = false;
-
-  if (ADMIN_PASSWORD_HASH) {
-    ok = await bcrypt.compare(pass, ADMIN_PASSWORD_HASH);
-  } else if (ADMIN_PASSWORD) {
-    ok = pass === ADMIN_PASSWORD;
-  } else {
-    ok = false;
-  }
+  if (ADMIN_PASSWORD_HASH) ok = await bcrypt.compare(pass, ADMIN_PASSWORD_HASH);
+  else if (ADMIN_PASSWORD) ok = pass === ADMIN_PASSWORD;
 
   if (!ok) return res.status(200).send(loginPage("Usuário ou senha inválidos."));
 
@@ -977,6 +996,61 @@ app.get("/admin", async (req, res) => {
 });
 
 // Chats & mensagens
+function periodToSql(period) {
+  const map = { "1d": "1 day", "7d": "7 days", "30d": "30 days", "90d": "90 days" };
+  return map[String(period)] || "7 days";
+}
+
+async function getStats(period) {
+  if (!pool) return { uniqueChats: 0, newChats: 0, received: 0, sent: 0 };
+
+  const interval = periodToSql(period);
+
+  const receivedR = await pool.query(`SELECT COUNT(*)::int AS c FROM cg_events WHERE received_at >= NOW() - INTERVAL '${interval}'`);
+  const sentR = await pool.query(`SELECT COUNT(*)::int AS c FROM cg_sends WHERE sent_at >= NOW() - INTERVAL '${interval}'`);
+  const uniqR = await pool.query(
+    `SELECT COUNT(DISTINCT celular)::int AS c FROM cg_events WHERE received_at >= NOW() - INTERVAL '${interval}' AND celular IS NOT NULL`
+  );
+  const newR = await pool.query(`
+    SELECT COUNT(*)::int AS c
+    FROM (
+      SELECT celular, MIN(received_at) AS first_seen
+      FROM cg_events
+      WHERE celular IS NOT NULL
+      GROUP BY celular
+    ) t
+    WHERE t.first_seen >= NOW() - INTERVAL '${interval}'
+  `);
+
+  return { uniqueChats: uniqR.rows[0].c, newChats: newR.rows[0].c, received: receivedR.rows[0].c, sent: sentR.rows[0].c };
+}
+
+async function getTopChats(period) {
+  if (!pool) return [];
+  const interval = periodToSql(period);
+
+  const r = await pool.query(`
+    SELECT
+      celular,
+      MAX(nome) AS nome,
+      COUNT(*)::int AS count,
+      MAX(received_at)::text AS last_at
+    FROM cg_events
+    WHERE received_at >= NOW() - INTERVAL '${interval}'
+      AND celular IS NOT NULL
+    GROUP BY celular
+    ORDER BY count DESC
+    LIMIT 15
+  `);
+  return r.rows;
+}
+
+async function getTrainingRows() {
+  if (!pool) return [];
+  const r = await pool.query(`SELECT created_at::text, tag, user_text, ideal_answer FROM ai_training ORDER BY id DESC LIMIT 30`);
+  return r.rows;
+}
+
 app.get("/admin/chats", async (req, res) => {
   if (!requireAdminSession(req, res)) return;
 
@@ -1057,7 +1131,7 @@ app.get("/admin/chats", async (req, res) => {
   res.status(200).send(htmlLayout("RT Admin - Chats", body));
 });
 
-// Alertas (email)
+// Alertas
 app.get("/admin/alerts", async (req, res) => {
   if (!requireAdminSession(req, res)) return;
 
@@ -1196,7 +1270,7 @@ app.post("/admin/training", async (req, res) => {
   return res.redirect("/admin/training");
 });
 
-// ====== Admin APIs (JSON) ======
+// APIs
 app.get("/admin/api/stats", async (req, res) => {
   if (!isAdminAuthed(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
   const period = req.query.period || "7d";
@@ -1204,31 +1278,23 @@ app.get("/admin/api/stats", async (req, res) => {
   return res.status(200).json({ ok: true, period, stats });
 });
 
-// ====== OpenAI TEST (JSON) ======
 app.post("/admin/api/ai-test", async (req, res) => {
   try {
     const token = req.headers["x-rt-admin-token"];
     const okByToken = RT_ADMIN_TOKEN && token === RT_ADMIN_TOKEN;
     const okBySession = isAdminAuthed(req);
 
-    if (!okByToken && !okBySession) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
+    if (!okByToken && !okBySession) return res.status(401).json({ ok: false, error: "Unauthorized" });
 
     const { text } = req.body || {};
     if (!text) return res.status(400).json({ ok: false, error: "Body inválido. Envie { text }" });
 
     const canUseAI = ai.canUseAI();
-
     if (!canUseAI) {
-      return res
-        .status(200)
-        .json({ ok: true, model: ai.OPENAI_MODEL, reply: AUTO_REPLY_FALLBACK_TEXT, note: "AI disabled or missing key" });
+      return res.status(200).json({ ok: true, model: ai.OPENAI_MODEL, reply: AUTO_REPLY_FALLBACK_TEXT, note: "AI disabled or missing key" });
     }
 
-    // aqui também dá pra passar histórico se quiser, mas no teste não precisa
-    const reply = await ai.generateLockedReply(String(text), []);
-
+    const reply = await ai.generateLockedReply(String(text), [], {});
     return res.status(200).json({ ok: true, model: ai.OPENAI_MODEL, reply: String(reply || "").trim() });
   } catch (err) {
     const status = err?.response?.status || null;
@@ -1237,71 +1303,6 @@ app.post("/admin/api/ai-test", async (req, res) => {
     return res.status(500).json({ ok: false, error: msg, status });
   }
 });
-
-// ====== Stats functions ======
-function periodToSql(period) {
-  const map = { "1d": "1 day", "7d": "7 days", "30d": "30 days", "90d": "90 days" };
-  return map[String(period)] || "7 days";
-}
-
-async function getStats(period) {
-  if (!pool) {
-    return { uniqueChats: 0, newChats: 0, received: 0, sent: 0 };
-  }
-
-  const interval = periodToSql(period);
-
-  const receivedR = await pool.query(`SELECT COUNT(*)::int AS c FROM cg_events WHERE received_at >= NOW() - INTERVAL '${interval}'`);
-  const sentR = await pool.query(`SELECT COUNT(*)::int AS c FROM cg_sends WHERE sent_at >= NOW() - INTERVAL '${interval}'`);
-
-  const uniqR = await pool.query(
-    `SELECT COUNT(DISTINCT celular)::int AS c FROM cg_events WHERE received_at >= NOW() - INTERVAL '${interval}' AND celular IS NOT NULL`
-  );
-
-  const newR = await pool.query(`
-    SELECT COUNT(*)::int AS c
-    FROM (
-      SELECT celular, MIN(received_at) AS first_seen
-      FROM cg_events
-      WHERE celular IS NOT NULL
-      GROUP BY celular
-    ) t
-    WHERE t.first_seen >= NOW() - INTERVAL '${interval}'
-  `);
-
-  return {
-    uniqueChats: uniqR.rows[0].c,
-    newChats: newR.rows[0].c,
-    received: receivedR.rows[0].c,
-    sent: sentR.rows[0].c,
-  };
-}
-
-async function getTopChats(period) {
-  if (!pool) return [];
-  const interval = periodToSql(period);
-
-  const r = await pool.query(`
-    SELECT
-      celular,
-      MAX(nome) AS nome,
-      COUNT(*)::int AS count,
-      MAX(received_at)::text AS last_at
-    FROM cg_events
-    WHERE received_at >= NOW() - INTERVAL '${interval}'
-      AND celular IS NOT NULL
-    GROUP BY celular
-    ORDER BY count DESC
-    LIMIT 15
-  `);
-  return r.rows;
-}
-
-async function getTrainingRows() {
-  if (!pool) return [];
-  const r = await pool.query(`SELECT created_at::text, tag, user_text, ideal_answer FROM ai_training ORDER BY id DESC LIMIT 30`);
-  return r.rows;
-}
 
 // ====== Start ======
 (async () => {
@@ -1313,6 +1314,6 @@ async function getTrainingRows() {
     console.log(
       `AI_ENABLED=${ai.AI_ENABLED} | MODEL=${ai.OPENAI_MODEL} | RTBRAIN=${ai.RTBRAIN_TEXT ? "loaded" : "missing"} | ALLOWED_URAS=${ALLOWED_URAS.join(",")}`
     );
-    console.log(`BUFFER_WAIT_MS=${WAIT_BEFORE_REPLY_MS}`);
+    console.log(`BUFFER_SECONDS=${BUFFER_SECONDS}`);
   });
 })();

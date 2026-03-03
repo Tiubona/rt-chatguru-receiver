@@ -75,6 +75,10 @@ const ALLOWED_URAS = String(process.env.ALLOWED_URAS || "Testechat")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// ====== ✅ NOVO: Buffer de contexto (20s) ======
+const WAIT_BEFORE_REPLY_MS = 20000; // pedido: 20 segundos fixos
+const pendingByCelular = new Map(); // celular -> { timer, texts[], lastBody, lastEvent, lastSigBase }
+
 // ====== Helpers ======
 function appendEvent(obj) {
   try {
@@ -362,7 +366,7 @@ async function cfgSet(key, valueJson) {
   );
 }
 
-// ✅ NOVO: buscar histórico recente do chat para dar contexto pra IA
+// ✅ buscar histórico recente do chat para dar contexto pra IA
 async function getRecentChatHistory(celular, limit = 10) {
   if (!pool) return [];
   try {
@@ -595,6 +599,88 @@ function isAllowedUra(body) {
   return ALLOWED_URAS.includes(String(ura).trim());
 }
 
+// ====== ✅ NOVO: processamento do pacote (reaproveita sua lógica) ======
+async function processBufferedMessage({ celular, body, event, aggregatedText }) {
+  try {
+    const rawText = String(aggregatedText || "").toString();
+    const normalized = rawText.trim().toLowerCase();
+    const tipo = (body.tipo_mensagem || "").toString().toLowerCase();
+
+    // Só responde chat "humano"
+    if (!celular || !rawText.trim() || tipo !== "chat") {
+      return;
+    }
+
+    // Só responde quando URA for permitida (ex.: Testechat)
+    if (!isAllowedUra(body)) {
+      console.log("🧱 URA não permitida — ignorando. URA =", body?.bot_context?.URA);
+      return;
+    }
+
+    // --- trava anti-duplicação (agora usando o pacote agregado) ---
+    const lastStamp = body.datetime_post || event.receivedAt || "";
+    const sig = `${body.chat_id || ""}::${rawText.trim()}::${lastStamp}`;
+    if (lastChat && lastChat._lastSig === sig) {
+      console.log("🔁 Evento duplicado - ignorado:", sig);
+      return;
+    }
+    if (lastChat) lastChat._lastSig = sig;
+
+    // --- modo “teste” opcional (mantém o gatilho) ---
+    const forceTest = normalized === AUTO_TRIGGER_TEXT;
+
+    // Robô ligado de verdade: responde sempre (desde que URA permitida)
+    const SHOULD_REPLY = true;
+
+    if (!SHOULD_REPLY && !forceTest) {
+      console.log("🛑 SHOULD_REPLY=false e não foi gatilho 'teste'. Ignorando.");
+      return;
+    }
+
+    const missingCG = requireChatGuruConfig();
+    if (missingCG.length) {
+      console.log("⚠️ Não respondeu (faltam envs ChatGuru):", missingCG);
+      return;
+    }
+
+    const canUseAI = ai.canUseAI();
+
+    // Se IA não puder, envia fallback
+    if (!canUseAI) {
+      console.log("⚠️ IA desligada ou sem chave. Enviando fallback.");
+      await chatGuruSendPossiblyChunked({
+        chatNumber: String(celular),
+        fullText: AUTO_REPLY_FALLBACK_TEXT,
+        source: "auto",
+      });
+      return;
+    }
+
+    // Cinto adicional: se claramente fora do escopo, já manda fallback
+    if (ai.looksLikeOutOfScope(rawText)) {
+      const out = `Entendi. Essa dúvida foge do que eu tenho aqui agora — vou confirmar com a Larissa e já te retorno. 😉\n\nPra eu te ajudar no que é da RT: é sobre tatuagem, sobrancelha, estrias ou harmonização?`;
+      await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: out, source: "scope" });
+      return;
+    }
+
+    // histórico curto para dar contexto
+    const history = await getRecentChatHistory(String(celular), 10);
+
+    // ⚠️ aqui você já estava chamando com history
+    const reply = await ai.generateLockedReply(rawText, history);
+
+    const finalText = String(reply || "").trim() || AUTO_REPLY_FALLBACK_TEXT;
+
+    await chatGuruSendPossiblyChunked({
+      chatNumber: String(celular),
+      fullText: finalText,
+      source: "ai",
+    });
+  } catch (e) {
+    console.log("⚠️ AI/AUTO-REPLY erro:", e?.message || e);
+  }
+}
+
 // ====== Rotas base ======
 app.get("/", (_req, res) => res.status(200).json({ ok: true, service: "rt-chatguru-receiver" }));
 app.get("/health", (_req, res) => res.status(200).json({ status: "online" }));
@@ -639,85 +725,70 @@ app.post("/webhook/chatguru", async (req, res) => {
   appendEvent(event);
   await dbSaveEvent(body);
 
-  // ====== AUTO-REPLY / AI REPLY (TRAVADO) ======
+  // ✅ NOVO: responde 200 rápido e processa via buffer (20s)
   try {
     const rawText = (body.texto_mensagem || "").toString();
-    const normalized = rawText.trim().toLowerCase();
     const tipo = (body.tipo_mensagem || "").toString().toLowerCase();
 
-    // Só responde chat "humano"
+    // Só acumula "chat" humano com texto
     if (!celular || !rawText.trim() || tipo !== "chat") {
       return res.status(200).json({ ok: true, ignored: "non-chat-or-empty" });
     }
 
-    // Só responde quando URA for permitida (ex.: Testechat)
+    // Se URA não é permitida, nem coloca no buffer (mesma regra de antes)
     if (!isAllowedUra(body)) {
       console.log("🧱 URA não permitida — ignorando. URA =", body?.bot_context?.URA);
       return res.status(200).json({ ok: true, ignored: "ura_not_allowed" });
     }
 
-    // --- trava anti-duplicação ---
-    const sig = `${body.chat_id || ""}::${rawText.trim()}::${body.datetime_post || event.receivedAt || ""}`;
-    if (lastChat && lastChat._lastSig === sig) {
-      console.log("🔁 Evento duplicado - ignorado:", sig);
-      return res.status(200).json({ ok: true, duplicate: true });
-    }
-    if (lastChat) lastChat._lastSig = sig;
+    const key = String(celular);
 
-    // --- modo “teste” opcional (mantém o gatilho) ---
-    const forceTest = normalized === AUTO_TRIGGER_TEXT;
+    // cria/atualiza buffer
+    const existing = pendingByCelular.get(key) || null;
 
-    // Robô ligado de verdade: responde sempre (desde que URA permitida)
-    const SHOULD_REPLY = true;
+    const next = existing || {
+      timer: null,
+      texts: [],
+      lastBody: null,
+      lastEvent: null,
+    };
 
-    if (!SHOULD_REPLY && !forceTest) {
-      console.log("🛑 SHOULD_REPLY=false e não foi gatilho 'teste'. Ignorando.");
-      return res.status(200).json({ ok: true, ignored: "should_reply_false" });
-    }
+    next.texts.push(rawText.trim());
+    next.lastBody = body;   // guarda o "último" body pra URA/chat_id/datetime_post etc.
+    next.lastEvent = event; // idem
 
-    const missingCG = requireChatGuruConfig();
-    if (missingCG.length) {
-      console.log("⚠️ Não respondeu (faltam envs ChatGuru):", missingCG);
-      return res.status(200).json({ ok: true, warn: "missing_chatguru_env", missingCG });
-    }
+    // reseta timer 20s
+    if (next.timer) clearTimeout(next.timer);
 
-    const canUseAI = ai.canUseAI();
+    next.timer = setTimeout(async () => {
+      try {
+        const payload = pendingByCelular.get(key);
+        if (!payload) return;
 
-    // Se IA não puder, envia fallback
-    if (!canUseAI) {
-      console.log("⚠️ IA desligada ou sem chave. Enviando fallback.");
-      await chatGuruSendPossiblyChunked({
-        chatNumber: String(celular),
-        fullText: AUTO_REPLY_FALLBACK_TEXT,
-        source: "auto",
-      });
-      return res.status(200).json({ ok: true, fallback: true });
-    }
+        pendingByCelular.delete(key);
 
-    // Cinto adicional: se claramente fora do escopo, já manda fallback
-    if (ai.looksLikeOutOfScope(rawText)) {
-      const out = `Entendi. Essa dúvida foge do que eu tenho aqui agora — vou confirmar com a Larissa e já te retorno. 😉\n\nPra eu te ajudar no que é da RT: é sobre tatuagem, sobrancelha, estrias ou harmonização?`;
-      await chatGuruSendPossiblyChunked({ chatNumber: String(celular), fullText: out, source: "scope" });
-      return res.status(200).json({ ok: true, out_of_scope: true });
-    }
+        const aggregatedText = (payload.texts || []).filter(Boolean).join("\n").trim();
+        console.log(`⏳ Buffer 20s finalizado | celular=${key} | msgs=${payload.texts.length}`);
+        console.log("📦 Texto agregado:", aggregatedText);
 
-    // ✅ NOVO: histórico curto para dar contexto
-    const history = await getRecentChatHistory(String(celular), 10);
+        await processBufferedMessage({
+          celular: key,
+          body: payload.lastBody || {},
+          event: payload.lastEvent || { receivedAt: new Date().toISOString() },
+          aggregatedText,
+        });
+      } catch (e) {
+        console.log("⚠️ Buffer flush erro:", e?.message || e);
+      }
+    }, WAIT_BEFORE_REPLY_MS);
 
-    const reply = await ai.generateLockedReply(rawText, history);
+    pendingByCelular.set(key, next);
 
-    const finalText = String(reply || "").trim() || AUTO_REPLY_FALLBACK_TEXT;
-
-    await chatGuruSendPossiblyChunked({
-      chatNumber: String(celular),
-      fullText: finalText,
-      source: "ai",
-    });
+    return res.status(200).json({ ok: true, buffered: true, wait_ms: WAIT_BEFORE_REPLY_MS });
   } catch (e) {
-    console.log("⚠️ AI/AUTO-REPLY erro:", e?.message || e);
+    console.log("⚠️ Buffer setup erro:", e?.message || e);
+    return res.status(200).json({ ok: true });
   }
-
-  return res.status(200).json({ ok: true });
 });
 
 // ====== send-test (manual) ======
@@ -1155,7 +1226,7 @@ app.post("/admin/api/ai-test", async (req, res) => {
         .json({ ok: true, model: ai.OPENAI_MODEL, reply: AUTO_REPLY_FALLBACK_TEXT, note: "AI disabled or missing key" });
     }
 
-    // ✅ aqui também dá pra passar histórico se quiser, mas no teste não precisa
+    // aqui também dá pra passar histórico se quiser, mas no teste não precisa
     const reply = await ai.generateLockedReply(String(text), []);
 
     return res.status(200).json({ ok: true, model: ai.OPENAI_MODEL, reply: String(reply || "").trim() });
@@ -1242,5 +1313,6 @@ async function getTrainingRows() {
     console.log(
       `AI_ENABLED=${ai.AI_ENABLED} | MODEL=${ai.OPENAI_MODEL} | RTBRAIN=${ai.RTBRAIN_TEXT ? "loaded" : "missing"} | ALLOWED_URAS=${ALLOWED_URAS.join(",")}`
     );
+    console.log(`BUFFER_WAIT_MS=${WAIT_BEFORE_REPLY_MS}`);
   });
 })();
